@@ -332,6 +332,8 @@ class BaseWorkerHandler(ABC):
         self.dp_range = get_dp_range_for_worker(self.engine_client.vllm_config)
         self._sleep_wake_lock = asyncio.Lock()
         self._engine_is_sleeping = False
+        # S2 (RL-Scaling): current disaggregation role; flipped by DualModeWorker.
+        self._disaggregation_mode: str | None = None
 
         # Initialize InputParamManager for text-in-text-out mode
         tokenizer = None
@@ -421,6 +423,20 @@ class BaseWorkerHandler(ABC):
             except Exception as e:
                 logger.error(f"Failed to wake up engine: {e}")
                 return {"status": "error", "message": str(e)}
+
+    def set_disaggregation_mode(self, mode: str) -> None:
+        """S2 (RL-Scaling): record the worker's current role.
+
+        ``mode`` is one of ``"prefill"`` / ``"decode"`` / ``"agg"``. The value
+        is consumed by :class:`dynamo.vllm.dual_mode.DualModeWorker` when it
+        re-registers the endpoint after a successful role flip.
+        """
+        if mode not in {"prefill", "decode", "agg"}:
+            raise ValueError(f"unknown disaggregation mode: {mode!r}")
+        self._disaggregation_mode = mode
+
+    def get_disaggregation_mode(self) -> str | None:
+        return self._disaggregation_mode
 
     @abstractmethod
     async def generate(self, request, context) -> AsyncGenerator[dict, None]:
