@@ -1,0 +1,119 @@
+# Build & push the RL-Scaling vLLM-runtime image.
+#
+# Triggered by:
+#   • any push to the RL-Scaling branch (path-filtered to source code that
+#     actually changes the runtime image)
+#   • a repository_dispatch from the upstream RL-Scaling controller repo
+#     when it explicitly asks for a new worker image (event-type
+#     `rl-scaling-build`)
+#   • manual workflow_dispatch
+#
+# Output image: ghcr.io/<owner>/dynamo-vllm-runtime:rl-scaling-<short-sha>
+#               (also tagged :rl-scaling-latest on branch pushes)
+
+name: RL-Scaling Build
+
+on:
+  push:
+    branches: [RL-Scaling]
+    paths:
+      - "components/**"
+      - "lib/**"
+      - "container/**"
+      - "Cargo.*"
+      - "pyproject.toml"
+      - "hatch_build.py"
+      - ".github/workflows/rl-scaling-build.yml"
+  repository_dispatch:
+    types: [rl-scaling-build]
+  workflow_dispatch:
+
+concurrency:
+  group: rl-scaling-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest-16-cores      # adjust to whatever your fork uses
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: RL-Scaling, fetch-depth: 1 }
+
+      # Free up runner disk – Dynamo image is ~25 GB during build
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag
+        id: meta
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "tag=rl-scaling-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository_owner }}/dynamo-vllm-runtime" >> "$GITHUB_OUTPUT"
+
+      - name: Render Dockerfile
+        run: |
+          python3 -m pip install pyyaml jinja2
+          python3 container/render.py \
+              --framework vllm --target runtime --cuda-version 12.9 \
+              --platform amd64 --output-short-filename
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/rendered.Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:rl-scaling-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            rl-scaling.branch=RL-Scaling
+            rl-scaling.sha=${{ github.sha }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## RL-Scaling worker image"
+            echo "* image: \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`"
+            echo "* sha:   \`${{ github.sha }}\`"
+            echo
+            echo "Deploy with:"
+            echo '```bash'
+            echo "DYNAMO_IMAGE_REGISTRY=ghcr.io/${{ github.repository_owner }} \\"
+            echo "DYNAMO_IMAGE_REPO=dynamo-vllm-runtime \\"
+            echo "RELEASE_VERSION=${{ steps.meta.outputs.tag }} \\"
+            echo "./deploy/RL-scaling/deploy-dynamo.sh --router"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Notify back to the controller repo so its CD pipeline can pick this up
+      - name: Notify controller repo
+        if: github.event_name != 'repository_dispatch'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.CONTROLLER_DISPATCH_TOKEN }}
+          repository: shqizhang/RL-Scaling
+          event-type: dynamo-image-ready
+          client-payload: |
+            {"image":"${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}",
+             "sha":"${{ github.sha }}"}
