@@ -38,7 +38,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest-16-cores      # adjust to whatever your fork uses
+    # NOTE: ubuntu-latest-16-cores is a paid larger-runner not available on
+    # personal forks. Standard ubuntu-latest + the free-disk-space step below
+    # gives ~44 GB which is enough for the rendered vllm runtime image.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with: { ref: RL-Scaling, fetch-depth: 1 }
