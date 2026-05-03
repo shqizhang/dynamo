@@ -2,32 +2,40 @@
 # SPDX-License-Identifier: Apache-2.0
 """S3 — Request consolidation HTTP handlers (RL-Scaling).
 
-Phase 2 (Option A — pragmatic): smart recompute-prefill migration.
+Phase 2 (v3 · fact-corrected, two-tier delivery):
 
-The KV cache itself is **not** transferred between workers (true KV-D2D is
-tracked separately and requires deep vLLM scheduler integration). Instead,
-``migrate_in`` re-prefills ``prompt + generated`` on the destination and
-continues decoding from there, paying one extra prefill in exchange for the
-ability to drain a worker before scaling down.
+* **Phase-2.A (零风险, 已交付)** — smart recompute-prefill migration with
+  :class:`MigrationPolicy` cost-benefit gate + prefix-cache awareness.
+  ``migrate_out`` additionally exposes ``src_block_ids`` (looked up via
+  :class:`RequestBlockIndex`, which wraps the existing
+  ``KvbmCacheManager.get_block_ids`` PyO3-exposed API) so a future Phase-2.B
+  invocation has everything it needs without changing the wire protocol.
 
-Phase 2 improvements over the Phase-1 always-recompute path:
+* **Phase-2.B (骨架已交付, 待 GPU 验证)** — true KV-D2D migration via
+  :class:`~dynamo.vllm.migration_connector.RLScalingMigrationConnector`. When
+  ``MigrationHandler`` is constructed with ``connector`` set, ``migrate_in``
+  first tries the connector path (registers the request as decode-only,
+  connector then NIXL-pulls source blocks in ``start_load_kv``); on any
+  failure it falls back to the Phase-2.A recompute path.
 
-1. **Cost-benefit gate** — :class:`MigrationPolicy` declines migration when
-   the recompute cost likely exceeds the savings. The controller can then
-   leave the request on its source worker and pick a different drain target.
-2. **Prefix-cache awareness** — the recompute prefill on the destination is
-   expected to hit the local prefix cache (when ``enable_prefix_caching=True``)
-   so the recompute cost is amortised to ~30-40 ms instead of ~100 ms.
-   :class:`MigrationHandler` warns at construction time if the engine's
-   prefix-cache flag is missing or False.
-3. **Wildcard ``*``** — picks the *most-progressed* request rather than the
-   first one, maximising the work that survives the migration.
+Design reference: ``RL-Scaling/tutorial/scaling/RL_Scaling_Unified_Design.md``
+§Phase 2 (v3) and ``dynamo/RL_SCALING_PYTHON_CHANGES.md``.
 
-Public surface (unchanged contract):
+Public surface (backward-compatible — existing Phase-1 callers unchanged):
 
-    handler = MigrationHandler(tracker, policy=MigrationPolicy(), engine=...)
-    await handler.migrate_out({"request_id": rid}) -> serialized state
-    await handler.migrate_in({"request_id": rid, ...}) -> {"status": "ok"|"declined"|"error"}
+    handler = MigrationHandler(
+        tracker,
+        policy=MigrationPolicy(),
+        engine=engine,
+        block_index=RequestBlockIndex(kvbm_cache_manager),  # 可选
+        connector=migration_connector,                       # 可选 (Phase-2.B)
+    )
+    await handler.migrate_out({"request_id": rid})
+        -> {status, request_id, prompt_tokens, generated_tokens,
+            sampling_params, stop_conditions,
+            src_block_ids?, nixl_handshake_meta?}
+    await handler.migrate_in({...})
+        -> {status: "ok"|"declined"|"error", path: "recompute"|"connector", ...}
 """
 from __future__ import annotations
 
@@ -52,6 +60,73 @@ class RequestTracker(Protocol):
 
     async def list_active_request_ids(self) -> Iterable[str]:
         """Used to resolve the ``"*"`` placeholder."""
+
+
+class _BlockIdSource(Protocol):
+    """Subset of :class:`kvbm.vllm_integration.kv_cache_manager.KvbmCacheManager`
+    we depend on. Kept as a Protocol so tests can mock it without importing
+    torch / kvbm Rust extensions.
+    """
+
+    def get_block_ids(self, request_id: str) -> list[list[int]]: ...
+
+
+class RequestBlockIndex:
+    """Thin adapter over ``KvbmCacheManager.get_block_ids``.
+
+    The Rust KVBM cache manager already maintains a per-request block list
+    keyed by ``request_id`` and exposes it via PyO3 at
+    ``lib/bindings/kvbm/python/kvbm/vllm_integration/kv_cache_manager.py:295``.
+    Phase-2.B's true-D2D migration path needs to know which physical block
+    IDs hold a request's KV; this class is the read-only Python view of that.
+
+    Returns ``None`` when the request is unknown, has been freed, or the
+    underlying cache manager is unavailable — callers must treat it as a
+    best-effort hint, not a guarantee.
+    """
+
+    def __init__(self, kvbm_cache_manager: Optional[_BlockIdSource]) -> None:
+        self._kvbm = kvbm_cache_manager
+
+    def lookup(self, request_id: str) -> Optional[list[int]]:
+        """Return a flat list of block IDs for ``request_id`` or ``None``.
+
+        ``KvbmCacheManager.get_block_ids`` returns ``list[list[int]]`` where
+        the outer list is per kv-cache group (always length 1 today). We
+        flatten it for callers that just want "the blocks for this request".
+        """
+        if self._kvbm is None:
+            return None
+        try:
+            grouped = self._kvbm.get_block_ids(request_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("get_block_ids(%s) failed", request_id, exc_info=True)
+            return None
+        if not grouped:
+            return None
+        flat: list[int] = []
+        for group in grouped:
+            flat.extend(int(b) for b in group)
+        return flat or None
+
+
+class _MigrationConnector(Protocol):
+    """Surface :class:`MigrationHandler` uses on the connector side.
+
+    See :mod:`dynamo.vllm.migration_connector` for the full vLLM-facing
+    KVConnectorBase_V1 implementation. Kept as a Protocol here so the
+    handler test suite stays import-light.
+    """
+
+    async def attach_remote_blocks(
+        self,
+        request_id: str,
+        src_block_ids: list[int],
+        nixl_handshake_meta: dict,
+        replay_token_count: int,
+    ) -> None: ...
+
+    def nixl_handshake_meta(self) -> Optional[dict]: ...
 
 
 # ----------------------------------------------------------------- policy
@@ -83,10 +158,14 @@ class MigrationHandler:
         tracker: RequestTracker,
         policy: Optional[MigrationPolicy] = None,
         engine: Any = None,
+        block_index: Optional[RequestBlockIndex] = None,
+        connector: Optional[_MigrationConnector] = None,
     ) -> None:
         self._tracker = tracker
         self._policy = policy or MigrationPolicy()
         self._engine = engine
+        self._block_index = block_index or RequestBlockIndex(None)
+        self._connector = connector
         self._warn_if_prefix_cache_disabled()
 
     # ------------------------------------------------------------------ API
@@ -104,8 +183,17 @@ class MigrationHandler:
         state = await self._tracker.get_request_state(request_id)
         if state is None:
             return {"status": "error", "message": f"unknown request_id {request_id!r}"}
+
+        # Look up source-side block IDs **before** abort: KVBM frees blocks
+        # synchronously on abort, so the lookup must happen first.
+        src_block_ids = self._block_index.lookup(request_id)
+        nixl_handshake_meta = (
+            self._connector.nixl_handshake_meta() if self._connector else None
+        )
+
         await self._tracker.abort_request(request_id)
-        return {
+
+        response: dict = {
             "status": "ok",
             "request_id": request_id,
             "prompt_tokens": state["prompt_tokens"],
@@ -113,6 +201,11 @@ class MigrationHandler:
             "sampling_params": state["sampling_params"],
             "stop_conditions": state.get("stop_conditions", {}),
         }
+        if src_block_ids is not None:
+            response["src_block_ids"] = src_block_ids
+        if nixl_handshake_meta is not None:
+            response["nixl_handshake_meta"] = nixl_handshake_meta
+        return response
 
     async def migrate_in(self, body: dict) -> dict:
         request_id = self._validate_id(body)
@@ -132,7 +225,56 @@ class MigrationHandler:
                 "request_id": request_id,
             }
 
-        # Recompute-prefill: the new "prompt" is prompt_tokens + generated_tokens.
+        # Phase-2.B: try the connector path first when both connector and
+        # source-side metadata are available. Any failure falls back to the
+        # Phase-2.A recompute path.
+        if (
+            self._connector is not None
+            and body.get("src_block_ids")
+            and body.get("nixl_handshake_meta")
+        ):
+            try:
+                replay_token_count = (
+                    len(body["prompt_tokens"]) + len(body["generated_tokens"])
+                )
+                await self._connector.attach_remote_blocks(
+                    request_id=request_id,
+                    src_block_ids=list(body["src_block_ids"]),
+                    nixl_handshake_meta=dict(body["nixl_handshake_meta"]),
+                    replay_token_count=replay_token_count,
+                )
+                # Connector signals vLLM to skip prefill via
+                # get_num_new_matched_tokens() at the next scheduler step;
+                # the handler just registers the request as decode-ready.
+                replay_prompt = (
+                    list(body["prompt_tokens"]) + list(body["generated_tokens"])
+                )
+                payload = {
+                    "prompt_tokens": replay_prompt,
+                    "sampling_params": body["sampling_params"],
+                    "stop_conditions": body.get("stop_conditions", {}),
+                    "previously_emitted_tokens": list(body["generated_tokens"]),
+                    "migration_meta": {
+                        "path": "connector",
+                        "src_block_ids": list(body["src_block_ids"]),
+                    },
+                }
+                await self._tracker.submit_request(request_id, payload)
+                return {
+                    "status": "ok",
+                    "request_id": request_id,
+                    "path": "connector",
+                    "replay_tokens": replay_token_count,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Migration] connector path failed for %s (%s); "
+                    "falling back to recompute-prefill",
+                    request_id,
+                    exc,
+                )
+
+        # Phase-2.A: recompute-prefill (the new "prompt" is prompt + generated).
         replay_prompt = list(body["prompt_tokens"]) + list(body["generated_tokens"])
         payload = {
             "prompt_tokens": replay_prompt,
@@ -144,6 +286,7 @@ class MigrationHandler:
         return {
             "status": "ok",
             "request_id": request_id,
+            "path": "recompute",
             "replay_tokens": len(replay_prompt),
         }
 

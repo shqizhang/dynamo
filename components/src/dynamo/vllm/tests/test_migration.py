@@ -252,3 +252,157 @@ class TestPrefixCacheWarning:
         assert not any(
             "enable_prefix_caching" in rec.message for rec in caplog.records
         )
+
+
+# ============================================================================
+# Phase 2.B (v3) — RequestBlockIndex + connector path coverage
+# ============================================================================
+from dynamo.vllm.migration import RequestBlockIndex
+
+
+class _FakeKvbm:
+    """Mimics ``KvbmCacheManager.get_block_ids`` shape ``list[list[int]]``."""
+
+    def __init__(self, mapping: dict[str, list[int]]) -> None:
+        self.mapping = mapping
+        self.calls: list[str] = []
+
+    def get_block_ids(self, request_id: str) -> list[list[int]]:
+        self.calls.append(request_id)
+        if request_id not in self.mapping:
+            raise KeyError(request_id)
+        return [self.mapping[request_id]]
+
+
+class TestRequestBlockIndex:
+    def test_returns_none_when_kvbm_missing(self):
+        idx = RequestBlockIndex(None)
+        assert idx.lookup("r1") is None
+
+    def test_flattens_grouped_block_ids(self):
+        idx = RequestBlockIndex(_FakeKvbm({"r1": [7, 8, 9, 10]}))
+        assert idx.lookup("r1") == [7, 8, 9, 10]
+
+    def test_returns_none_when_kvbm_raises(self):
+        idx = RequestBlockIndex(_FakeKvbm({}))  # any lookup raises KeyError
+        assert idx.lookup("r1") is None
+
+    def test_returns_none_for_empty_groups(self):
+        class _Empty:
+            def get_block_ids(self, rid):
+                return []
+        assert RequestBlockIndex(_Empty()).lookup("r1") is None
+
+
+class TestMigrateOutWithBlockIndex:
+    @pytest.mark.asyncio
+    async def test_migrate_out_includes_src_block_ids(self, tracker):
+        idx = RequestBlockIndex(_FakeKvbm({"r1": [7, 8, 9, 10]}))
+        h = MigrationHandler(tracker, block_index=idx)
+        out = await h.migrate_out({"request_id": "r1"})
+        assert out["status"] == "ok"
+        assert out["src_block_ids"] == [7, 8, 9, 10]
+
+    @pytest.mark.asyncio
+    async def test_migrate_out_omits_field_when_unknown(self, tracker):
+        idx = RequestBlockIndex(_FakeKvbm({}))
+        h = MigrationHandler(tracker, block_index=idx)
+        out = await h.migrate_out({"request_id": "r1"})
+        assert out["status"] == "ok"
+        assert "src_block_ids" not in out  # graceful absence
+
+    @pytest.mark.asyncio
+    async def test_lookup_happens_before_abort(self, tracker):
+        """Abort frees blocks in KVBM; lookup must run first."""
+        kvbm = _FakeKvbm({"r1": [7, 8]})
+        h = MigrationHandler(tracker, block_index=RequestBlockIndex(kvbm))
+        out = await h.migrate_out({"request_id": "r1"})
+        assert kvbm.calls == ["r1"]
+        assert tracker.aborted == ["r1"]
+        assert out["src_block_ids"] == [7, 8]
+
+
+class _FakeConnector:
+    def __init__(self, *, raises: bool = False, handshake: dict | None = None) -> None:
+        self.raises = raises
+        self.handshake = handshake
+        self.attached: list[dict] = []
+
+    def nixl_handshake_meta(self):
+        return self.handshake
+
+    async def attach_remote_blocks(
+        self, request_id, src_block_ids, nixl_handshake_meta, replay_token_count
+    ):
+        if self.raises:
+            raise RuntimeError("simulated NIXL handshake failure")
+        self.attached.append({
+            "request_id": request_id,
+            "src_block_ids": list(src_block_ids),
+            "replay": replay_token_count,
+        })
+
+
+class TestConnectorPath:
+    @pytest.mark.asyncio
+    async def test_migrate_out_includes_handshake_when_connector_present(self, tracker):
+        conn = _FakeConnector(handshake={"agent": "W2-nixl", "addr": "tcp://1.2.3.4:5555"})
+        h = MigrationHandler(tracker, connector=conn)
+        out = await h.migrate_out({"request_id": "r1"})
+        assert out["nixl_handshake_meta"] == {"agent": "W2-nixl", "addr": "tcp://1.2.3.4:5555"}
+
+    @pytest.mark.asyncio
+    async def test_migrate_in_uses_connector_when_metadata_present(self):
+        tr = FakeTracker()
+        conn = _FakeConnector()
+        permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
+        h = MigrationHandler(tr, policy=permissive, connector=conn)
+        out = await h.migrate_in({
+            "request_id": "r1",
+            "prompt_tokens": [1, 2, 3],
+            "generated_tokens": [10, 11, 12],
+            "sampling_params": {"temperature": 0.7},
+            "src_block_ids": [7, 8],
+            "nixl_handshake_meta": {"agent": "W2"},
+        })
+        assert out["status"] == "ok"
+        assert out["path"] == "connector"
+        assert conn.attached and conn.attached[0]["src_block_ids"] == [7, 8]
+        assert tr.submitted[0][1]["migration_meta"]["path"] == "connector"
+
+    @pytest.mark.asyncio
+    async def test_migrate_in_falls_back_when_connector_raises(self, caplog):
+        tr = FakeTracker()
+        conn = _FakeConnector(raises=True)
+        permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
+        h = MigrationHandler(tr, policy=permissive, connector=conn)
+        with caplog.at_level("WARNING"):
+            out = await h.migrate_in({
+                "request_id": "r1",
+                "prompt_tokens": [1, 2, 3],
+                "generated_tokens": [10, 11, 12],
+                "sampling_params": {},
+                "src_block_ids": [7],
+                "nixl_handshake_meta": {"agent": "x"},
+            })
+        assert out["status"] == "ok"
+        assert out["path"] == "recompute"  # fell back
+        assert tr.submitted and "migration_meta" not in tr.submitted[0][1]
+        assert any("connector path failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_migrate_in_uses_recompute_when_no_block_metadata(self):
+        tr = FakeTracker()
+        conn = _FakeConnector()
+        permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
+        h = MigrationHandler(tr, policy=permissive, connector=conn)
+        # Source did not provide src_block_ids/handshake -> recompute path.
+        out = await h.migrate_in({
+            "request_id": "r1",
+            "prompt_tokens": [1, 2, 3],
+            "generated_tokens": [10, 11, 12],
+            "sampling_params": {},
+        })
+        assert out["status"] == "ok"
+        assert out["path"] == "recompute"
+        assert conn.attached == []
