@@ -11,16 +11,18 @@ High-level flow (mirrors design doc S2.4 / S2.7):
 
     1. Acquire the per-worker switch lock (idempotency guard).
     2. ``handler.sleep(level=2)`` — drain in-flight, free KV memory.
-    3. Reconfigure NIXL agent for the new role (stub: see ``_reconfig_nixl``).
-    4. Reconfigure KV pool for the new role (stub: see ``_reconfig_kv_pool``).
+    3. ``_reconfig_nixl(target_role)`` — invalidate cached NIXL connector handle.
+    4. ``_reconfig_kv_pool(target_role)`` — call ``engine.reset_prefix_cache()``
+       so the new role starts with a clean GPU block budget.
     5. ``handler.set_disaggregation_mode(target_role)``.
     6. ``handler.wake_up()`` — re-register endpoint to the routing pool.
-    7. Emit ``WorkerRoleChanged`` to the KV router (stub: see ``_emit_role_changed``).
+    7. ``_emit_role_changed`` — push the new role label to discovery + (optional)
+       router event publisher.
 
-The Rust-side reconfig APIs (NIXL, KV pool) and the new ``WorkerRoleChanged``
-event variant are tracked as TODO. Until they land, those steps are no-ops
-that log a warning so an integration smoke test can still exercise the
-sleep/wake path end-to-end. See ``RUST_CHANGES.md`` for the planned patches.
+All three reconfig steps are best-effort: each wraps its real call in
+``try/log/continue`` so that a failure in one step does not leave the worker
+stuck asleep. The orchestration's outer ``except`` guarantees a recovery
+``wake_up`` even if reconfig fails entirely.
 """
 from __future__ import annotations
 
@@ -115,7 +117,7 @@ class DualModeWorker:
                         "switch_time_ms": (time.monotonic() - t0) * 1000.0,
                     }
 
-                # 2-3. Reconfigure NIXL + KV pool (stubs — see RUST_CHANGES.md).
+                # 2-3. Reconfigure NIXL handle + KV pool for the new role.
                 await self._reconfig_nixl(target_role)
                 await self._reconfig_kv_pool(target_role)
 
@@ -151,36 +153,131 @@ class DualModeWorker:
                     "switch_time_ms": (time.monotonic() - t0) * 1000.0,
                 }
 
-    # -------------------------------------------------------- stubbed Rust ops
-    async def _reconfig_nixl(self, target_role: str) -> None:
-        """TODO(RL-Scaling-S2): call ``handler.engine_client.reconfig_nixl(...)``.
-
-        The Rust-side NIXL agent currently has no reconfig API. Until that
-        lands the stub is a no-op so existing single-mode workers continue to
-        function unchanged.
-        """
-        logger.info("[DualMode] _reconfig_nixl(%s) — stubbed; no Rust reconfig API yet", target_role)
-
+    # -------------------------------------------------------- real reconfig ops
     async def _reconfig_kv_pool(self, target_role: str) -> None:
-        """TODO(RL-Scaling-S2): call ``handler.engine_client.reconfig_kv_pool(...)``.
+        """Reset the KV prefix cache so the new role starts with a clean pool.
 
-        Decode mode wants a large KV pool; prefill mode wants a tiny one.
-        Implementing this requires a vLLM patch that exposes the pool
-        allocator at runtime. Stubbed for now.
+        vLLM 0.16 exposes ``engine.reset_prefix_cache()`` (also used by the
+        existing ``clear_kv_blocks`` handler). Calling it after sleep frees all
+        cached blocks held by the previous role, letting the new role's traffic
+        shape (decode = long sequences, prefill = many short ones) make full
+        use of the GPU block budget without eviction churn.
+
+        We do **not** resize ``cache_config.num_gpu_blocks`` at runtime — that
+        would require ``_initialize_kv_caches`` re-execution which is fragile
+        on a sleeping engine. The block budget is shared and the prefix cache
+        eviction policy lets each role saturate it on demand.
         """
-        logger.info("[DualMode] _reconfig_kv_pool(%s) — stubbed; no allocator API yet", target_role)
-
-    async def _emit_role_changed(self, from_role: str, to_role: str) -> None:
-        """TODO(RL-Scaling-S2): emit ``WorkerRoleChanged`` to the KV router."""
-        if self._publisher is None:
+        engine = getattr(self._handler, "engine_client", None)
+        if engine is None:
+            logger.warning(
+                "[DualMode] reconfig_kv_pool(%s): handler has no engine_client; skipping",
+                target_role,
+            )
+            return
+        reset = getattr(engine, "reset_prefix_cache", None)
+        if reset is None:
+            logger.warning(
+                "[DualMode] reconfig_kv_pool(%s): engine has no reset_prefix_cache; skipping",
+                target_role,
+            )
             return
         try:
+            result = reset()
+            if asyncio.iscoroutine(result):
+                await result
+            logger.info(
+                "[DualMode] reconfig_kv_pool(%s): reset_prefix_cache OK", target_role
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[DualMode] reconfig_kv_pool(%s): reset failed: %s; continuing",
+                target_role,
+                exc,
+            )
+
+    async def _reconfig_nixl(self, target_role: str) -> None:
+        """Drop any cached NIXL connector handle so the next request rebuilds it.
+
+        vLLM 0.16's ``kv_transfer_config`` is fixed at engine construction;
+        we cannot swap connectors at runtime without recreating the engine.
+        What we CAN do is invalidate the handler's cached NIXL connector handle
+        so the next request rebuilds it against the engine's current connector
+        state — preventing stale prefill→decode xfer slots from leaking across
+        a role flip.
+        """
+        handler = self._handler
+        nixl = getattr(handler, "_nixl_connector", None)
+        if nixl is None:
+            logger.info(
+                "[DualMode] reconfig_nixl(%s): no cached nixl connector; nothing to drop",
+                target_role,
+            )
+            return
+        try:
+            handler._nixl_connector = None
+            shutdown = getattr(nixl, "shutdown", None) or getattr(nixl, "close", None)
+            if shutdown is not None:
+                result = shutdown()
+                if asyncio.iscoroutine(result):
+                    await result
+            logger.info(
+                "[DualMode] reconfig_nixl(%s): dropped cached nixl connector",
+                target_role,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[DualMode] reconfig_nixl(%s): drop failed: %s; continuing",
+                target_role,
+                exc,
+            )
+
+    async def _emit_role_changed(self, from_role: str, to_role: str) -> None:
+        """Push the new role to discovery + (optionally) publish to the router.
+
+        Two complementary paths:
+
+        1. **Endpoint metadata** — if the discovery endpoint exposes
+           ``update_metadata``, push ``{"disaggregation_mode": to_role}``.
+           The KV router's worker selector picks this up on its next refresh.
+           Note: ``wake_up`` already re-registered the endpoint, so any
+           metadata set via :meth:`BaseWorkerHandler.set_disaggregation_mode`
+           is already on record; this call is the explicit transition signal.
+
+        2. **Publisher event** — if a router event publisher exposes
+           ``publish_role_changed``, emit it. This is for routers that track
+           role transitions independently of registration events.
+        """
+        endpoint = getattr(self._handler, "generate_endpoint", None)
+        if endpoint is not None:
+            update = getattr(endpoint, "update_metadata", None)
+            if update is not None:
+                try:
+                    result = update({"disaggregation_mode": to_role})
+                    if asyncio.iscoroutine(result):
+                        await result
+                    logger.info(
+                        "[DualMode] emit_role_changed: pushed metadata disaggregation_mode=%s",
+                        to_role,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[DualMode] emit_role_changed: update_metadata failed: %s", exc
+                    )
+
+        if self._publisher is not None:
             publish = getattr(self._publisher, "publish_role_changed", None)
-            if publish is None:
-                logger.debug("publisher has no publish_role_changed; skipping")
-                return
-            res = publish(from_role=from_role, to_role=to_role)
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to publish WorkerRoleChanged")
+            if publish is not None:
+                try:
+                    res = publish(from_role=from_role, to_role=to_role)
+                    if asyncio.iscoroutine(res):
+                        await res
+                    logger.info(
+                        "[DualMode] emit_role_changed: published WorkerRoleChanged(%s->%s)",
+                        from_role,
+                        to_role,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[DualMode] emit_role_changed: publish failed: %s", exc
+                    )
