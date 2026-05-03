@@ -90,6 +90,38 @@ if [[ -n "${GHCR_USERNAME:-}" && -n "${GHCR_PAT:-}" ]]; then
       sed -i "s|- name: nvcr-imagepullsecret|- name: nvcr-imagepullsecret\n          - name: ghcr-imagepullsecret|g"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Overwrite-style cleanup: remove ANY pre-existing DGD/DGDSA in the target
+# namespace so the new deploy is the only stack serving the model. Without
+# this, multiple DGDs (e.g. an old `vllm-disagg-planner` left over from a
+# previous tutorial) would each spin up their own Frontend + workers, and
+# clients would have to know which Service to hit.
+#
+# Set RL_SCALING_NO_OVERWRITE=1 to skip cleanup (e.g. when explicitly running
+# multiple stacks side-by-side for A/B testing).
+# ─────────────────────────────────────────────────────────────────────────────
+: "${NAMESPACE:=dynamo-system}"
+if [[ "${RL_SCALING_NO_OVERWRITE:-0}" != "1" ]]; then
+  echo "==> Overwrite mode: removing existing DGD/DGDSA in namespace ${NAMESPACE}"
+  EXISTING_DGD="$(kubectl -n "${NAMESPACE}" get dgd -o name 2>/dev/null || true)"
+  EXISTING_DGDSA="$(kubectl -n "${NAMESPACE}" get dgdsa -o name 2>/dev/null || true)"
+  if [[ -n "${EXISTING_DGDSA}" ]]; then
+    echo "    deleting DGDSA: ${EXISTING_DGDSA}"
+    kubectl -n "${NAMESPACE}" delete ${EXISTING_DGDSA} --wait=false || true
+  fi
+  if [[ -n "${EXISTING_DGD}" ]]; then
+    echo "    deleting DGD:   ${EXISTING_DGD}"
+    kubectl -n "${NAMESPACE}" delete ${EXISTING_DGD} --wait=false || true
+    echo "    waiting for worker pods to terminate (max 180s)..."
+    kubectl -n "${NAMESPACE}" wait --for=delete pods \
+        -l dynamo.nvidia.com/component=worker --timeout=180s 2>/dev/null || true
+    kubectl -n "${NAMESPACE}" wait --for=delete pods \
+        -l dynamo.nvidia.com/component=frontend --timeout=60s 2>/dev/null || true
+  fi
+  echo "==> Cleanup done. Remaining pods:"
+  kubectl -n "${NAMESPACE}" get pods 2>/dev/null | grep -Ev "operator|nats" || true
+fi
+
 # Invoke upstream deployer
 export MANIFEST_DIR="${TMP_MANIFESTS}"
 export RELEASE_VERSION
