@@ -257,7 +257,7 @@ async def start_sidecar(
     """
     web = _try_import_aiohttp()
     if port is None:
-        port = int(os.environ.get("DYNAMO_RL_SIDECAR_PORT", "9090"))
+        port = int(os.environ.get("DYNAMO_RL_SIDECAR_PORT", "9091"))
     app = build_app(
         dual_mode_worker=dual_mode_worker,
         migration_handler=migration_handler,
