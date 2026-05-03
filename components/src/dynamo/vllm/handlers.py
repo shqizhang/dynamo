@@ -334,6 +334,12 @@ class BaseWorkerHandler(ABC):
         self._engine_is_sleeping = False
         # S2 (RL-Scaling): current disaggregation role; flipped by DualModeWorker.
         self._disaggregation_mode: str | None = None
+        # S3 (RL-Scaling): in-flight request registry for migration. Kept on the
+        # base handler so both prefill + decode workers update it (only decode
+        # actually serves /migrate_*, but uniform recording avoids surprises).
+        # Set by main.py at construction time when sidecar is enabled; left as
+        # None when feature is off (writes become no-ops).
+        self.request_registry = None  # type: ignore[assignment]
 
         # Initialize InputParamManager for text-in-text-out mode
         tokenizer = None
@@ -1231,6 +1237,29 @@ class BaseWorkerHandler(ABC):
         trace_headers=None,
         priority=0,
     ):
+        # RL-Scaling S3: register the request with the in-flight tracker so
+        # /migrate_out can retrieve its state. Best-effort: extracting prompt
+        # tokens from a TokensPrompt is straightforward; for TextPrompt we
+        # skip (sidecar will treat such requests as un-migratable).
+        registry = getattr(self, "request_registry", None)
+        if registry is not None:
+            try:
+                prompt_tokens_for_reg = list(getattr(prompt, "prompt_token_ids", []) or [])
+                sp_dict = {}
+                for k in ("temperature", "top_p", "top_k", "max_tokens", "min_tokens",
+                          "presence_penalty", "frequency_penalty", "repetition_penalty",
+                          "stop", "stop_token_ids", "seed", "n"):
+                    v = getattr(sampling_params, k, None)
+                    if v is not None:
+                        sp_dict[k] = v
+                registry.register(
+                    request_id,
+                    prompt_tokens_for_reg,
+                    sp_dict,
+                    stop_conditions={},
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("request_registry.register failed", exc_info=True)
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
             self._log_with_lora_context(
@@ -1268,7 +1297,15 @@ class BaseWorkerHandler(ABC):
 
                 output = res.outputs[0]
                 next_total_toks = len(output.token_ids)
-                out = {"token_ids": output.token_ids[num_output_tokens_so_far:]}
+                new_token_ids = output.token_ids[num_output_tokens_so_far:]
+                out = {"token_ids": new_token_ids}
+                # RL-Scaling S3: stream new tokens into the registry so a
+                # later /migrate_out can replay them on the destination.
+                if registry is not None and new_token_ids:
+                    try:
+                        registry.record_tokens(request_id, new_token_ids)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("request_registry.record_tokens failed", exc_info=True)
 
                 # Extract logprobs for new tokens if available
                 tokenizer = getattr(self.engine_client, "tokenizer", None)
@@ -1305,6 +1342,12 @@ class BaseWorkerHandler(ABC):
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
+        finally:
+            if registry is not None:
+                try:
+                    registry.deregister(request_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("request_registry.deregister failed", exc_info=True)
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):

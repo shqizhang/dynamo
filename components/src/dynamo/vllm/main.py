@@ -815,6 +815,74 @@ async def init(
     )
     handler.add_temp_dir(prometheus_temp_dir)
 
+    # ---------------- RL-Scaling: in-process HTTP sidecar (S2 + S3) ----------
+    # Wires DualModeWorker (POST /switch_role, GET /v1/role) and
+    # MigrationHandler (POST /migrate_out, POST /migrate_in) onto an aiohttp
+    # server. Disabled when DYNAMO_RL_SIDECAR_DISABLED=1.
+    sidecar_runner = None
+    if os.environ.get("DYNAMO_RL_SIDECAR_DISABLED") != "1":
+        try:
+            from dynamo.vllm.dual_mode import DualModeWorker
+            from dynamo.vllm.migration import MigrationHandler, MigrationPolicy, RequestBlockIndex
+            from dynamo.vllm.rl_scaling_sidecar import (
+                EngineRequestTracker,
+                InProcessRequestRegistry,
+                make_nixl_meta_provider,
+                make_submit_request_callback,
+                start_sidecar,
+            )
+
+            registry = InProcessRequestRegistry()
+            handler.request_registry = registry
+
+            initial_role = (
+                "decode"
+                if config.disaggregation_mode == DisaggregationMode.DECODE
+                else "prefill"
+                if config.disaggregation_mode == DisaggregationMode.PREFILL
+                else "decode"
+            )
+            dual_mode = DualModeWorker(handler, initial_role=initial_role)
+
+            # Best-effort: KVBM cache manager exposed via engine internals.
+            try:
+                kvbm_cm = getattr(
+                    engine_client.engine_core, "kv_cache_manager", None
+                )
+            except Exception:  # noqa: BLE001
+                kvbm_cm = None
+
+            tracker = EngineRequestTracker(
+                engine_client=engine_client,
+                registry=registry,
+                submit_request_callback=make_submit_request_callback(engine_client),
+            )
+            connector_enabled = (
+                os.environ.get("DYNAMO_RL_CONNECTOR_ENABLED", "").lower()
+                in ("1", "true", "yes")
+            )
+            migration_handler = MigrationHandler(
+                tracker,
+                policy=MigrationPolicy(),
+                engine=engine_client,
+                block_index=RequestBlockIndex(kvbm_cm),
+                nixl_meta_provider=make_nixl_meta_provider(vllm_config),
+                connector_enabled=connector_enabled,
+            )
+            sidecar_runner, _site = await start_sidecar(
+                dual_mode_worker=dual_mode,
+                migration_handler=migration_handler,
+                initial_role=initial_role,
+                registry=registry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RLScalingSidecar] failed to start (%s); continuing without it",
+                exc,
+            )
+            sidecar_runner = None
+    # -------------------------------------------------------------------------
+
     # Check if kv event consolidator is enabled (port was allocated in setup_vllm_engine)
     consolidator_enabled = False
     consolidator_port = None
@@ -928,6 +996,11 @@ async def init(
         logger.debug("Cleaning up decode worker")
         # Cleanup background tasks
         handler.cleanup()
+        if sidecar_runner is not None:
+            try:
+                await sidecar_runner.cleanup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[RLScalingSidecar] cleanup raised: %s", exc)
 
 
 def get_engine_cache_info(engine: AsyncLLM):
