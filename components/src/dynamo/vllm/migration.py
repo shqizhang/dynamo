@@ -2,24 +2,45 @@
 # SPDX-License-Identifier: Apache-2.0
 """S3 — Request consolidation HTTP handlers (RL-Scaling).
 
-Phase 2 (v3 · fact-corrected, two-tier delivery):
+Phase 2 (v3.5 · vLLM-native KV-D2D, two-tier delivery):
 
-* **Phase-2.A (零风险, 已交付)** — smart recompute-prefill migration with
+* **Phase-2.A (已交付 · 零风险)** — smart recompute-prefill migration with
   :class:`MigrationPolicy` cost-benefit gate + prefix-cache awareness.
   ``migrate_out`` additionally exposes ``src_block_ids`` (looked up via
   :class:`RequestBlockIndex`, which wraps the existing
-  ``KvbmCacheManager.get_block_ids`` PyO3-exposed API) so a future Phase-2.B
+  ``KvbmCacheManager.get_block_ids`` PyO3-exposed API) so a Phase-2.B
   invocation has everything it needs without changing the wire protocol.
 
-* **Phase-2.B (骨架已交付, 待 GPU 验证)** — true KV-D2D migration via
-  :class:`~dynamo.vllm.migration_connector.RLScalingMigrationConnector`. When
-  ``MigrationHandler`` is constructed with ``connector`` set, ``migrate_in``
-  first tries the connector path (registers the request as decode-only,
-  connector then NIXL-pulls source blocks in ``start_load_kv``); on any
-  failure it falls back to the Phase-2.A recompute path.
+* **Phase-2.B (已交付主路径 · 需 GPU验证上线)** — real KV-D2D via vLLM's
+  built-in ``NixlConnector``. Architecture insight from fact-check (v3.5):
+  vLLM 0.16's ``NixlConnector`` already implements
+  ``kv_transfer_params``-driven NIXL READ pull (see vLLM 0.16
+  ``nixl_connector.py:177-220, 2063-2371`` and dynamo
+  ``handlers.py:1577-1589`` for the disagg-PD usage). When a worker is
+  deployed with that connector in its KV-transfer chain (``DynamoConnector``
+  + ``NixlConnector`` via ``MultiConnector``, the PD-disagg layout this
+  cluster already uses), migrate_in just needs to inject
+  ``sampling_params.extra_args["kv_transfer_params"]`` and vLLM does the
+  rest — no custom KVConnector subclass required.
 
-Design reference: ``RL-Scaling/tutorial/scaling/RL_Scaling_Unified_Design.md``
-§Phase 2 (v3) and ``dynamo/RL_SCALING_PYTHON_CHANGES.md``.
+  ``MigrationHandler`` is constructed with ``nixl_meta_provider`` (a
+  callable returning the *source* worker's NIXL coordinates, plumbed by
+  ``main.py`` from the engine's ``KvTransferConfig``); ``migrate_out``
+  packages those plus ``src_block_ids`` into the response’s
+  ``kv_transfer_params`` field. ``migrate_in`` forwards the dict verbatim
+  onto the resubmitted request. Any failure path falls back to Phase-2.A
+  recompute.
+
+  **Known correctness gap (block-hold)**: Phase-2.B currently calls
+  ``abort_request`` on the source immediately, which frees the src KV
+  blocks before the dst's NIXL READ has a chance to complete. In
+  production this needs the same "hold blocks alive until dst confirms
+  pull" mechanism vLLM disagg-PD uses (``request_finished -> (True, None)``
+  + ``get_finished``). Until the hold mechanism is wired,
+  Phase-2.B remains gated behind ``connector_enabled=False`` (the safe
+  default), and the connector path falls back to Phase-2.A on every
+  migrate_in. See ``RL_SCALING_PYTHON_CHANGES.md`` for the GPU-validation
+  TODO list.
 
 Public surface (backward-compatible — existing Phase-1 callers unchanged):
 
@@ -27,13 +48,16 @@ Public surface (backward-compatible — existing Phase-1 callers unchanged):
         tracker,
         policy=MigrationPolicy(),
         engine=engine,
-        block_index=RequestBlockIndex(kvbm_cache_manager),  # 可选
-        connector=migration_connector,                       # 可选 (Phase-2.B)
+        block_index=RequestBlockIndex(kvbm_cache_manager),     # 可选
+        nixl_meta_provider=lambda: {"engine_id": ...,           # 可选 (Phase-2.B)
+                                    "host": ..., "port": ...},
+        connector_enabled=False,                                # 安全默认
     )
     await handler.migrate_out({"request_id": rid})
         -> {status, request_id, prompt_tokens, generated_tokens,
             sampling_params, stop_conditions,
-            src_block_ids?, nixl_handshake_meta?}
+            src_block_ids?,        # iff KVBM block_index available
+            kv_transfer_params?}   # iff connector_enabled and NIXL meta available
     await handler.migrate_in({...})
         -> {status: "ok"|"declined"|"error", path: "recompute"|"connector", ...}
 """
@@ -41,7 +65,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -110,23 +134,19 @@ class RequestBlockIndex:
         return flat or None
 
 
-class _MigrationConnector(Protocol):
-    """Surface :class:`MigrationHandler` uses on the connector side.
-
-    See :mod:`dynamo.vllm.migration_connector` for the full vLLM-facing
-    KVConnectorBase_V1 implementation. Kept as a Protocol here so the
-    handler test suite stays import-light.
-    """
-
-    async def attach_remote_blocks(
-        self,
-        request_id: str,
-        src_block_ids: list[int],
-        nixl_handshake_meta: dict,
-        replay_token_count: int,
-    ) -> None: ...
-
-    def nixl_handshake_meta(self) -> Optional[dict]: ...
+#: Callable that returns this worker's NIXL listener coordinates so
+#: ``migrate_out`` can advertise them to the destination. Plumbed by
+#: ``main.py`` from the engine's ``KvTransferConfig`` once NixlConnector has
+#: registered its KV caches. Expected dict shape (matches vLLM 0.16's
+#: ``kv_transfer_params`` schema)::
+#:
+#:     {"engine_id": str, "host": str, "port": int}
+#:
+#: Returning ``None`` (or the callable being ``None``) means "no NIXL coords
+#: available right now" — ``migrate_out`` will simply omit
+#: ``kv_transfer_params`` from its response, which makes ``migrate_in`` fall
+#: back to the Phase-2.A recompute path automatically.
+NixlMetaProvider = Callable[[], Optional[dict]]
 
 
 # ----------------------------------------------------------------- policy
@@ -159,13 +179,22 @@ class MigrationHandler:
         policy: Optional[MigrationPolicy] = None,
         engine: Any = None,
         block_index: Optional[RequestBlockIndex] = None,
-        connector: Optional[_MigrationConnector] = None,
+        nixl_meta_provider: Optional[NixlMetaProvider] = None,
+        connector_enabled: bool = False,
     ) -> None:
         self._tracker = tracker
         self._policy = policy or MigrationPolicy()
         self._engine = engine
         self._block_index = block_index or RequestBlockIndex(None)
-        self._connector = connector
+        self._nixl_meta_provider = nixl_meta_provider
+        # Phase-2.B is feature-flagged. Until the source-side block-hold
+        # mechanism (analogous to disagg-PD's request_finished -> True
+        # + get_finished pattern) is wired, immediate abort_request on the
+        # source races with the dst's NIXL READ. With connector_enabled=False
+        # we keep producing src_block_ids in migrate_out responses (zero risk,
+        # forward-compatible) but migrate_in still goes through the safe
+        # recompute path even if the wire protocol carries kv_transfer_params.
+        self._connector_enabled = connector_enabled
         self._warn_if_prefix_cache_disabled()
 
     # ------------------------------------------------------------------ API
@@ -187,9 +216,7 @@ class MigrationHandler:
         # Look up source-side block IDs **before** abort: KVBM frees blocks
         # synchronously on abort, so the lookup must happen first.
         src_block_ids = self._block_index.lookup(request_id)
-        nixl_handshake_meta = (
-            self._connector.nixl_handshake_meta() if self._connector else None
-        )
+        nixl_coords = self._read_nixl_meta()
 
         await self._tracker.abort_request(request_id)
 
@@ -203,8 +230,25 @@ class MigrationHandler:
         }
         if src_block_ids is not None:
             response["src_block_ids"] = src_block_ids
-        if nixl_handshake_meta is not None:
-            response["nixl_handshake_meta"] = nixl_handshake_meta
+        if (
+            self._connector_enabled
+            and src_block_ids is not None
+            and nixl_coords is not None
+        ):
+            # Build the same shape vLLM 0.16's NixlConnector expects on the
+            # decode side (see handlers.py:1577 for the disagg-PD use of the
+            # same dict). vLLM’s NixlConnectorScheduler at
+            # nixl_connector.py:add_new_req_to_recv reads exactly these
+            # fields.
+            response["kv_transfer_params"] = {
+                "do_remote_prefill": True,
+                "do_remote_decode": False,
+                "remote_engine_id": nixl_coords["engine_id"],
+                "remote_block_ids": list(src_block_ids),
+                "remote_host": nixl_coords["host"],
+                "remote_port": int(nixl_coords["port"]),
+                "remote_request_id": request_id,
+            }
         return response
 
     async def migrate_in(self, body: dict) -> dict:
@@ -225,38 +269,28 @@ class MigrationHandler:
                 "request_id": request_id,
             }
 
-        # Phase-2.B: try the connector path first when both connector and
-        # source-side metadata are available. Any failure falls back to the
-        # Phase-2.A recompute path.
-        if (
-            self._connector is not None
-            and body.get("src_block_ids")
-            and body.get("nixl_handshake_meta")
-        ):
+        replay_prompt = list(body["prompt_tokens"]) + list(body["generated_tokens"])
+        kv_transfer_params = body.get("kv_transfer_params")
+
+        # Phase-2.B: when the source provided NIXL coordinates AND the
+        # connector path is locally enabled, route via vLLM's NixlConnector.
+        # The connector chain (DynamoConnector + NixlConnector via
+        # MultiConnector) reads sampling_params.extra_args["kv_transfer_params"]
+        # and issues an async NIXL READ pull during the next scheduler step
+        # (see vLLM 0.16 nixl_connector.py:start_load_kv -> _read_blocks).
+        if self._connector_enabled and kv_transfer_params:
             try:
-                replay_token_count = (
-                    len(body["prompt_tokens"]) + len(body["generated_tokens"])
-                )
-                await self._connector.attach_remote_blocks(
-                    request_id=request_id,
-                    src_block_ids=list(body["src_block_ids"]),
-                    nixl_handshake_meta=dict(body["nixl_handshake_meta"]),
-                    replay_token_count=replay_token_count,
-                )
-                # Connector signals vLLM to skip prefill via
-                # get_num_new_matched_tokens() at the next scheduler step;
-                # the handler just registers the request as decode-ready.
-                replay_prompt = (
-                    list(body["prompt_tokens"]) + list(body["generated_tokens"])
-                )
                 payload = {
                     "prompt_tokens": replay_prompt,
                     "sampling_params": body["sampling_params"],
                     "stop_conditions": body.get("stop_conditions", {}),
                     "previously_emitted_tokens": list(body["generated_tokens"]),
+                    "kv_transfer_params": dict(kv_transfer_params),
                     "migration_meta": {
                         "path": "connector",
-                        "src_block_ids": list(body["src_block_ids"]),
+                        "src_block_ids": list(
+                            kv_transfer_params.get("remote_block_ids") or []
+                        ),
                     },
                 }
                 await self._tracker.submit_request(request_id, payload)
@@ -264,7 +298,7 @@ class MigrationHandler:
                     "status": "ok",
                     "request_id": request_id,
                     "path": "connector",
-                    "replay_tokens": replay_token_count,
+                    "replay_tokens": len(replay_prompt),
                 }
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -275,7 +309,6 @@ class MigrationHandler:
                 )
 
         # Phase-2.A: recompute-prefill (the new "prompt" is prompt + generated).
-        replay_prompt = list(body["prompt_tokens"]) + list(body["generated_tokens"])
         payload = {
             "prompt_tokens": replay_prompt,
             "sampling_params": body["sampling_params"],
@@ -289,6 +322,29 @@ class MigrationHandler:
             "path": "recompute",
             "replay_tokens": len(replay_prompt),
         }
+
+    # ------------------------------------------------------------------ utils
+    def _read_nixl_meta(self) -> Optional[dict]:
+        """Best-effort fetch of the source's NIXL listener coordinates."""
+        if self._nixl_meta_provider is None:
+            return None
+        try:
+            meta = self._nixl_meta_provider()
+        except Exception:  # noqa: BLE001
+            logger.debug("nixl_meta_provider() raised", exc_info=True)
+            return None
+        if not meta:
+            return None
+        # Validate the shape our wire protocol promises.
+        for key in ("engine_id", "host", "port"):
+            if key not in meta:
+                logger.warning(
+                    "[Migration] nixl_meta_provider returned dict missing %r; "
+                    "omitting kv_transfer_params from migrate_out response",
+                    key,
+                )
+                return None
+        return meta
 
     # ------------------------------------------------------------------ utils
     def _should_migrate(self, body: dict) -> tuple[bool, str]:

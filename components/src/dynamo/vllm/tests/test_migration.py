@@ -322,87 +322,158 @@ class TestMigrateOutWithBlockIndex:
         assert out["src_block_ids"] == [7, 8]
 
 
-class _FakeConnector:
-    def __init__(self, *, raises: bool = False, handshake: dict | None = None) -> None:
-        self.raises = raises
-        self.handshake = handshake
-        self.attached: list[dict] = []
+class _FakeNixlMeta:
+    def __init__(self, meta: dict | None) -> None:
+        self.meta = meta
+        self.calls = 0
 
-    def nixl_handshake_meta(self):
-        return self.handshake
-
-    async def attach_remote_blocks(
-        self, request_id, src_block_ids, nixl_handshake_meta, replay_token_count
-    ):
-        if self.raises:
-            raise RuntimeError("simulated NIXL handshake failure")
-        self.attached.append({
-            "request_id": request_id,
-            "src_block_ids": list(src_block_ids),
-            "replay": replay_token_count,
-        })
+    def __call__(self):
+        self.calls += 1
+        return self.meta
 
 
-class TestConnectorPath:
+class TestMigrateOutWithNixlMeta:
     @pytest.mark.asyncio
-    async def test_migrate_out_includes_handshake_when_connector_present(self, tracker):
-        conn = _FakeConnector(handshake={"agent": "W2-nixl", "addr": "tcp://1.2.3.4:5555"})
-        h = MigrationHandler(tracker, connector=conn)
+    async def test_migrate_out_includes_kv_transfer_params(self, tracker):
+        idx = RequestBlockIndex(_FakeKvbm({"r1": [7, 8, 9, 10]}))
+        provider = _FakeNixlMeta({"engine_id": "src-eid", "host": "10.0.0.1", "port": 5557})
+        h = MigrationHandler(
+            tracker,
+            block_index=idx,
+            nixl_meta_provider=provider,
+            connector_enabled=True,
+        )
         out = await h.migrate_out({"request_id": "r1"})
-        assert out["nixl_handshake_meta"] == {"agent": "W2-nixl", "addr": "tcp://1.2.3.4:5555"}
+        assert out["status"] == "ok"
+        params = out["kv_transfer_params"]
+        assert params["do_remote_prefill"] is True
+        assert params["do_remote_decode"] is False
+        assert params["remote_engine_id"] == "src-eid"
+        assert params["remote_block_ids"] == [7, 8, 9, 10]
+        assert params["remote_host"] == "10.0.0.1"
+        assert params["remote_port"] == 5557
+        assert params["remote_request_id"] == "r1"
 
     @pytest.mark.asyncio
-    async def test_migrate_in_uses_connector_when_metadata_present(self):
+    async def test_kv_params_omitted_when_connector_disabled(self, tracker):
+        idx = RequestBlockIndex(_FakeKvbm({"r1": [7, 8]}))
+        provider = _FakeNixlMeta({"engine_id": "src", "host": "h", "port": 1})
+        h = MigrationHandler(
+            tracker,
+            block_index=idx,
+            nixl_meta_provider=provider,
+            connector_enabled=False,  # <<< default safe path
+        )
+        out = await h.migrate_out({"request_id": "r1"})
+        assert "kv_transfer_params" not in out
+        # src_block_ids still surfaced for forward-compatibility
+        assert out["src_block_ids"] == [7, 8]
+
+    @pytest.mark.asyncio
+    async def test_kv_params_omitted_when_meta_missing_field(self, tracker):
+        idx = RequestBlockIndex(_FakeKvbm({"r1": [7]}))
+        provider = _FakeNixlMeta({"engine_id": "src"})  # missing host/port
+        h = MigrationHandler(
+            tracker, block_index=idx, nixl_meta_provider=provider, connector_enabled=True
+        )
+        out = await h.migrate_out({"request_id": "r1"})
+        assert "kv_transfer_params" not in out
+
+    @pytest.mark.asyncio
+    async def test_kv_params_omitted_when_provider_raises(self, tracker):
+        def boom():
+            raise RuntimeError("nixl coords not ready")
+        h = MigrationHandler(
+            tracker,
+            block_index=RequestBlockIndex(_FakeKvbm({"r1": [7]})),
+            nixl_meta_provider=boom,
+            connector_enabled=True,
+        )
+        out = await h.migrate_out({"request_id": "r1"})
+        assert "kv_transfer_params" not in out
+
+
+class TestMigrateInConnectorPath:
+    @pytest.mark.asyncio
+    async def test_migrate_in_uses_connector_when_kv_transfer_params_present(self):
         tr = FakeTracker()
-        conn = _FakeConnector()
         permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
-        h = MigrationHandler(tr, policy=permissive, connector=conn)
+        h = MigrationHandler(tr, policy=permissive, connector_enabled=True)
+        kv_params = {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_engine_id": "src-eid",
+            "remote_block_ids": [7, 8],
+            "remote_host": "10.0.0.1",
+            "remote_port": 5557,
+            "remote_request_id": "r1",
+        }
         out = await h.migrate_in({
             "request_id": "r1",
             "prompt_tokens": [1, 2, 3],
             "generated_tokens": [10, 11, 12],
             "sampling_params": {"temperature": 0.7},
-            "src_block_ids": [7, 8],
-            "nixl_handshake_meta": {"agent": "W2"},
+            "kv_transfer_params": kv_params,
         })
         assert out["status"] == "ok"
         assert out["path"] == "connector"
-        assert conn.attached and conn.attached[0]["src_block_ids"] == [7, 8]
-        assert tr.submitted[0][1]["migration_meta"]["path"] == "connector"
+        rid, payload = tr.submitted[0]
+        assert payload["kv_transfer_params"] == kv_params
+        assert payload["migration_meta"]["path"] == "connector"
 
     @pytest.mark.asyncio
-    async def test_migrate_in_falls_back_when_connector_raises(self, caplog):
+    async def test_migrate_in_uses_recompute_when_connector_disabled_at_dst(self):
         tr = FakeTracker()
-        conn = _FakeConnector(raises=True)
         permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
-        h = MigrationHandler(tr, policy=permissive, connector=conn)
-        with caplog.at_level("WARNING"):
-            out = await h.migrate_in({
-                "request_id": "r1",
-                "prompt_tokens": [1, 2, 3],
-                "generated_tokens": [10, 11, 12],
-                "sampling_params": {},
-                "src_block_ids": [7],
-                "nixl_handshake_meta": {"agent": "x"},
-            })
-        assert out["status"] == "ok"
-        assert out["path"] == "recompute"  # fell back
-        assert tr.submitted and "migration_meta" not in tr.submitted[0][1]
-        assert any("connector path failed" in r.message for r in caplog.records)
+        # dst worker has connector disabled (e.g. it's not a NIXL-enabled deploy)
+        h = MigrationHandler(tr, policy=permissive, connector_enabled=False)
+        out = await h.migrate_in({
+            "request_id": "r1",
+            "prompt_tokens": [1, 2, 3],
+            "generated_tokens": [10, 11, 12],
+            "sampling_params": {},
+            "kv_transfer_params": {"remote_engine_id": "x"},  # ignored
+        })
+        assert out["path"] == "recompute"
+        rid, payload = tr.submitted[0]
+        assert "kv_transfer_params" not in payload
 
     @pytest.mark.asyncio
-    async def test_migrate_in_uses_recompute_when_no_block_metadata(self):
+    async def test_migrate_in_recompute_when_no_kv_transfer_params(self):
         tr = FakeTracker()
-        conn = _FakeConnector()
         permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
-        h = MigrationHandler(tr, policy=permissive, connector=conn)
-        # Source did not provide src_block_ids/handshake -> recompute path.
+        h = MigrationHandler(tr, policy=permissive, connector_enabled=True)
         out = await h.migrate_in({
             "request_id": "r1",
             "prompt_tokens": [1, 2, 3],
             "generated_tokens": [10, 11, 12],
             "sampling_params": {},
         })
-        assert out["status"] == "ok"
         assert out["path"] == "recompute"
-        assert conn.attached == []
+
+    @pytest.mark.asyncio
+    async def test_migrate_in_falls_back_when_submit_raises_in_connector_path(self, caplog):
+        class _Boom(FakeTracker):
+            def __init__(self):
+                super().__init__()
+                self._first = True
+            async def submit_request(self, rid, payload):
+                if self._first and "kv_transfer_params" in payload:
+                    self._first = False
+                    raise RuntimeError("injected failure")
+                self.submitted.append((rid, payload))
+        tr = _Boom()
+        permissive = MigrationPolicy(min_generated_tokens=0, min_remaining_tokens=0)
+        h = MigrationHandler(tr, policy=permissive, connector_enabled=True)
+        with caplog.at_level("WARNING"):
+            out = await h.migrate_in({
+                "request_id": "r1",
+                "prompt_tokens": [1, 2, 3],
+                "generated_tokens": [10, 11, 12],
+                "sampling_params": {},
+                "kv_transfer_params": {"remote_engine_id": "x", "remote_block_ids": [1]},
+            })
+        assert out["path"] == "recompute"
+        # Fallback submit landed and did NOT carry kv_transfer_params.
+        assert tr.submitted and "kv_transfer_params" not in tr.submitted[0][1]
+        assert any("connector path failed" in r.message for r in caplog.records)
