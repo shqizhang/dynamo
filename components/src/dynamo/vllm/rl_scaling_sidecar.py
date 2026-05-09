@@ -33,6 +33,81 @@ from typing import Any, Awaitable, Callable, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------- self-pod label
+# K8s pod metadata.name is immutable, so a runtime role flip cannot rename
+# the pod.  We instead surface the role on a label that operators can view
+# with `kubectl get pod -L nvidia.com/dynamo-current-role`.  The patch is
+# a strategic-merge JSON to /api/v1/namespaces/<ns>/pods/<name> using the
+# in-cluster ServiceAccount token; it is best-effort and silently no-ops
+# outside of K8s (e.g. unit tests, local dev).
+_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+_SA_CA_PATH    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+_SA_NS_PATH    = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+
+async def _patch_self_pod_label(label_key: str, label_value: str) -> None:
+    """Patch a single label on the current pod via the in-cluster K8s API.
+
+    No-ops gracefully if any of the SA files / env vars are missing, so
+    the same code runs unmodified in unit tests and bare-metal dev.
+    """
+    pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME")
+    if not pod_name:
+        return
+    if not (
+        os.path.isfile(_SA_TOKEN_PATH)
+        and os.path.isfile(_SA_NS_PATH)
+    ):
+        return  # not running in a K8s pod with a mounted SA
+
+    api_host = os.environ.get("KUBERNETES_SERVICE_HOST")
+    api_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    if not api_host:
+        return
+
+    with open(_SA_TOKEN_PATH, "r", encoding="utf-8") as fh:
+        token = fh.read().strip()
+    with open(_SA_NS_PATH, "r", encoding="utf-8") as fh:
+        namespace = fh.read().strip()
+
+    url = (
+        f"https://{api_host}:{api_port}/api/v1/namespaces/"
+        f"{namespace}/pods/{pod_name}"
+    )
+    # Strategic-merge patch: only the listed label is changed; everything
+    # else on the pod is left untouched.  Escape '/' as '~1' per JSON-Patch
+    # rules — but strategic-merge takes a plain map, so a nested dict works.
+    patch_body = {"metadata": {"labels": {label_key: label_value}}}
+
+    from aiohttp import ClientSession, ClientTimeout, TCPConnector  # noqa: WPS433
+
+    ssl_ctx = None
+    if os.path.isfile(_SA_CA_PATH):
+        import ssl  # noqa: WPS433
+        ssl_ctx = ssl.create_default_context(cafile=_SA_CA_PATH)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/strategic-merge-patch+json",
+        "Accept":        "application/json",
+    }
+    timeout = ClientTimeout(total=5)
+    connector = TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+    async with ClientSession(timeout=timeout, connector=connector) as sess:
+        async with sess.patch(url, json=patch_body, headers=headers) as resp:
+            if resp.status >= 300:
+                txt = await resp.text()
+                logger.warning(
+                    "[RLScalingSidecar] pod label patch returned HTTP %d: %s",
+                    resp.status, txt[:200],
+                )
+            else:
+                logger.info(
+                    "[RLScalingSidecar] patched pod label %s=%s on %s/%s",
+                    label_key, label_value, namespace, pod_name,
+                )
+
+
 # --------------------------------------------------------------------- registry
 @dataclass
 class _RequestSnapshot:
@@ -199,6 +274,20 @@ def build_app(
             )
         result = await dual_mode_worker.switch_role(target)
         # DualModeWorker returns {status, new_role, switch_time_ms, ...}
+        # Best-effort: surface the new role as a pod label so that
+        # `kubectl get pod -L nvidia.com/dynamo-current-role` reflects
+        # the runtime state (pod metadata.name is immutable in K8s).
+        if isinstance(result, dict) and result.get("status") == "ok":
+            new_role = result.get("new_role") or target
+            try:
+                await _patch_self_pod_label(
+                    "nvidia.com/dynamo-current-role", str(new_role)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RLScalingSidecar] could not patch self pod label "
+                    "(non-fatal): %s", exc
+                )
         return web.json_response(result)
 
     async def post_migrate_out(request):
