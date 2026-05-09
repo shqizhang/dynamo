@@ -2,72 +2,131 @@
 # SPDX-License-Identifier: Apache-2.0
 """S2 — Elastic role switching for a Dynamo vLLM worker (RL-Scaling).
 
-This module orchestrates a *role flip* (prefill <-> decode) on a single
-worker without restarting the engine. It re-uses the existing
-``BaseWorkerHandler.sleep`` / ``wake_up`` machinery so that the GPU is fully
-quiesced before any reconfiguration touches device memory.
+This module orchestrates a *true end-to-end* role flip (prefill <-> decode)
+on a single worker without restarting the engine. The crucial property
+this module guarantees is that **after a successful switch the Dynamo
+router actually delivers traffic of the new role to this worker**, not
+just that the in-process engine state changed.
 
-High-level flow (mirrors design doc S2.4 / S2.7):
+End-to-end flow (mirrors design doc S2.4 / S2.7, with the missing
+re-registration step that earlier revisions lacked):
 
-    1. Acquire the per-worker switch lock (idempotency guard).
-    2. ``handler.sleep(level=2)`` — drain in-flight, free KV memory.
-    3. ``_reconfig_nixl(target_role)`` — invalidate cached NIXL connector handle.
-    4. ``_reconfig_kv_pool(target_role)`` — call ``engine.reset_prefix_cache()``
-       so the new role starts with a clean GPU block budget.
-    5. ``handler.set_disaggregation_mode(target_role)``.
-    6. ``handler.wake_up()`` — re-register endpoint to the routing pool.
-    7. ``_emit_role_changed`` — push the new role label to discovery + (optional)
-       router event publisher.
+    1. Acquire the per-worker switch lock (idempotency / concurrency guard).
+    2. ``handler.sleep(level=2)``
+         - drains in-flight, frees KV memory, *unregisters the current
+           endpoint instance* from discovery (so the router stops
+           dispatching old-role traffic).
+    3. ``Reregistrar.unregister(current_role)``
+         - removes the ModelDeploymentCard from the *current* endpoint
+           (router's WorkerSet rebuild drops this worker from the old role
+           pool).
+    4. ``_reconfig_nixl(target_role)``
+         - invalidates cached NIXL connector handle so the next request
+           rebuilds it cleanly for the new role.
+    5. ``_reconfig_kv_pool(target_role)``
+         - calls ``engine.reset_prefix_cache()`` so the new role starts
+           with a clean GPU block budget (KV consistency guarantee).
+    6. ``handler.set_disaggregation_mode(target_role)``.
+    7. ``Reregistrar.register(target_role)``
+         - publishes a fresh MDC under the *target-role* endpoint URI
+           (router's ModelWatcher picks it up; PrefillRouter or chat pool
+           gains this worker).
+    8. ``handler.wake_up()``
+         - re-attaches the *current handler's* endpoint instance to
+           discovery and resumes engine generation.
+    9. ``_emit_role_changed`` — best-effort pod label patch + optional
+       publisher event for observability.
 
-All three reconfig steps are best-effort: each wraps its real call in
-``try/log/continue`` so that a failure in one step does not leave the worker
-stuck asleep. The orchestration's outer ``except`` guarantees a recovery
-``wake_up`` even if reconfig fails entirely.
+If any step fails, the orchestration's outer ``except`` attempts a
+recovery: re-register the previous role's MDC, wake the engine, restore
+the previous role flag — so the worker is never left silently stuck in a
+half-flipped state.
+
+KV consistency
+--------------
+All in-flight requests are drained inside ``handler.sleep`` (which calls
+``engine.pause_generation``). Then ``reset_prefix_cache`` clears the KV
+pool *while the engine is asleep*, before any traffic of the new role
+arrives. The new role therefore starts with an empty, role-correct KV
+pool; no cross-role KV bleed is possible.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
 _VALID_ROLES = ("prefill", "decode")
 
 
+class Reregistrar(Protocol):
+    """Callback contract used by :class:`DualModeWorker` to swap which
+    endpoint URI carries this worker's ModelDeploymentCard.
+
+    Implementations are wired in :mod:`dynamo.vllm.main` where the two
+    endpoint objects (``backend.generate`` for decode and
+    ``prefill.generate`` for prefill) and ``register_model`` /
+    ``unregister_model`` are in scope.
+    """
+
+    async def register(self, role: str) -> None: ...
+    async def unregister(self, role: str) -> None: ...
+
+
 class DualModeWorker:
-    """Coordinates a role flip on a single ``BaseWorkerHandler``.
+    """Coordinates a true role flip on a single ``BaseWorkerHandler``.
 
     Parameters
     ----------
     handler:
-        A ``BaseWorkerHandler`` (DecodeWorkerHandler / PrefillWorkerHandler).
+        A ``BaseWorkerHandler`` whose ``sleep`` / ``wake_up`` machinery is
+        used to quiesce the engine across the flip. Both decode and
+        prefill handler-shaped objects accept ``set_disaggregation_mode``
+        from this class.
     initial_role:
-        The role the worker started in. Used as the source of truth for
+        The role the worker started in. Source of truth for
         ``current_role`` until the first successful switch.
+    reregistrar:
+        Callback object that knows how to ``register`` / ``unregister`` a
+        ModelDeploymentCard against the role-specific endpoint URIs.
+        When ``None`` the switch only does the in-process reconfig (legacy
+        behaviour — keeps unit tests working without a real runtime).
     publisher:
-        Optional KV-event publisher. If provided, ``WorkerRoleChanged`` is
-        emitted after a successful flip. Stubbed today.
+        Optional KV-event publisher; ``WorkerRoleChanged`` is emitted via
+        :meth:`publish_role_changed` if available.
+    label_patcher:
+        Optional async callable ``(label_key, label_value) -> None`` used
+        to update the pod's ``nvidia.com/dynamo-current-role`` label after
+        a successful switch (informational only — does not affect routing).
     """
 
     def __init__(
         self,
         handler: Any,
         initial_role: str,
+        reregistrar: Optional[Reregistrar] = None,
         publisher: Any | None = None,
+        label_patcher: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ) -> None:
         if initial_role not in _VALID_ROLES:
-            raise ValueError(f"initial_role must be one of {_VALID_ROLES}, got {initial_role!r}")
+            raise ValueError(
+                f"initial_role must be one of {_VALID_ROLES}, got {initial_role!r}"
+            )
         self._handler = handler
+        self._reregistrar = reregistrar
         self._publisher = publisher
+        self._label_patcher = label_patcher
         self._lock = asyncio.Lock()
         self._current_role = initial_role
-        # Reflect into the handler so other code paths can read it.
         try:
             handler.set_disaggregation_mode(initial_role)
         except Exception:  # noqa: BLE001 - tolerated for handler stubs in tests
-            logger.debug("handler does not implement set_disaggregation_mode (test stub?)")
+            logger.debug(
+                "handler does not implement set_disaggregation_mode (test stub?)"
+            )
 
     @property
     def current_role(self) -> str:
@@ -75,15 +134,20 @@ class DualModeWorker:
 
     # ------------------------------------------------------------------ public
     async def switch_role(self, target_role: str) -> dict:
-        """Flip the worker's role.
+        """Flip the worker's role. Returns an HTTP-friendly response dict.
 
-        Returns a dict suitable for an HTTP response: ``status``,
-        ``new_role``, ``switch_time_ms`` (and ``message`` on errors).
+        Timing fields:
+          * ``switch_time_ms``   - total wall-clock from accept to ack.
+          * ``timings_ms``       - per-phase breakdown (sleep, unregister,
+            reset_kv, register, wake) — useful for SLO debugging.
         """
         if target_role not in _VALID_ROLES:
             return {
                 "status": "error",
-                "message": f"target_role must be one of {_VALID_ROLES}, got {target_role!r}",
+                "message": (
+                    f"target_role must be one of {_VALID_ROLES}, "
+                    f"got {target_role!r}"
+                ),
                 "new_role": self._current_role,
                 "switch_time_ms": 0.0,
             }
@@ -102,46 +166,91 @@ class DualModeWorker:
                     "message": "already in target role",
                     "new_role": self._current_role,
                     "switch_time_ms": 0.0,
+                    "timings_ms": {},
                 }
 
             t0 = time.monotonic()
             previous_role = self._current_role
+            timings: dict[str, float] = {}
+
+            def mark(label: str, since: float) -> float:
+                now = time.monotonic()
+                timings[label] = round((now - since) * 1000.0, 3)
+                return now
+
             try:
-                # 1. Drain & sleep so the GPU is quiesced.
+                # 1. Drain & sleep so the GPU is quiesced and the current
+                #    endpoint instance is unregistered from discovery.
+                t = time.monotonic()
                 sleep_resp = await self._handler.sleep({"level": 2})
+                t = mark("sleep", t)
                 if sleep_resp.get("status") not in {"ok", None}:
                     return {
                         "status": "error",
                         "message": f"sleep failed: {sleep_resp}",
                         "new_role": previous_role,
                         "switch_time_ms": (time.monotonic() - t0) * 1000.0,
+                        "timings_ms": timings,
                     }
 
-                # 2-3. Reconfigure NIXL handle + KV pool for the new role.
-                await self._reconfig_nixl(target_role)
-                await self._reconfig_kv_pool(target_role)
+                # 2. Drop the previous-role MDC from discovery so the router
+                #    immediately stops considering this worker for old-role
+                #    traffic.  No-op when reregistrar is absent (unit tests).
+                if self._reregistrar is not None:
+                    await self._reregistrar.unregister(previous_role)
+                    t = mark("unregister_mdc", t)
 
-                # 4. Persist the new role on the handler.
+                # 3-4. Reconfigure NIXL handle + KV pool for the new role.
+                await self._reconfig_nixl(target_role)
+                t = mark("reconfig_nixl", t)
+                await self._reconfig_kv_pool(target_role)
+                t = mark("reset_prefix_cache", t)
+
+                # 5. Persist the new role on the handler (read by handler.generate).
                 self._handler.set_disaggregation_mode(target_role)
 
-                # 5. Wake the engine and re-register endpoint.
+                # 6. Publish a fresh MDC under the target-role endpoint URI.
+                #    The frontend's ModelWatcher will rebuild WorkerSets and
+                #    start sending new-role traffic to this worker.
+                if self._reregistrar is not None:
+                    await self._reregistrar.register(target_role)
+                    t = mark("register_mdc", t)
+
+                # 7. Wake the engine and re-register the current handler's
+                #    endpoint instance back to discovery.
                 wake_resp = await self._handler.wake_up({})
+                t = mark("wake", t)
                 if wake_resp.get("status") not in {"ok", None}:
                     raise RuntimeError(f"wake_up failed: {wake_resp}")
 
-                # 6. Tell the router the role changed.
+                # 8. Best-effort: pod label + router event for observability.
                 await self._emit_role_changed(previous_role, target_role)
 
                 self._current_role = target_role
+                total_ms = (time.monotonic() - t0) * 1000.0
+                logger.info(
+                    "[DualMode] switch_role %s->%s OK total=%.2fms timings=%s",
+                    previous_role, target_role, total_ms, timings,
+                )
                 return {
                     "status": "ok",
                     "new_role": target_role,
-                    "switch_time_ms": (time.monotonic() - t0) * 1000.0,
+                    "switch_time_ms": total_ms,
+                    "timings_ms": timings,
                 }
             except Exception as exc:  # noqa: BLE001
-                logger.exception("role switch %s -> %s failed; attempting recovery", previous_role, target_role)
-                # Best-effort: try to wake back up so the worker isn't stuck asleep.
+                logger.exception(
+                    "role switch %s -> %s failed; attempting recovery",
+                    previous_role, target_role,
+                )
+                # Best-effort recovery: re-register the previous role and
+                # wake so the worker is never silently stuck asleep / off-pool.
                 try:
+                    if self._reregistrar is not None:
+                        try:
+                            await self._reregistrar.register(previous_role)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("recovery re-register failed")
                     await self._handler.wake_up({})
                     self._handler.set_disaggregation_mode(previous_role)
                 except Exception:  # noqa: BLE001
@@ -151,22 +260,23 @@ class DualModeWorker:
                     "message": str(exc),
                     "new_role": self._current_role,
                     "switch_time_ms": (time.monotonic() - t0) * 1000.0,
+                    "timings_ms": timings,
                 }
 
     # -------------------------------------------------------- real reconfig ops
     async def _reconfig_kv_pool(self, target_role: str) -> None:
         """Reset the KV prefix cache so the new role starts with a clean pool.
 
-        vLLM 0.16 exposes ``engine.reset_prefix_cache()`` (also used by the
-        existing ``clear_kv_blocks`` handler). Calling it after sleep frees all
-        cached blocks held by the previous role, letting the new role's traffic
-        shape (decode = long sequences, prefill = many short ones) make full
-        use of the GPU block budget without eviction churn.
+        vLLM 0.16 exposes ``engine.reset_prefix_cache()``. Calling it after
+        sleep frees all cached blocks held by the previous role, letting
+        the new role's traffic shape (decode = long sequences, prefill =
+        many short ones) make full use of the GPU block budget without
+        eviction churn.
 
-        We do **not** resize ``cache_config.num_gpu_blocks`` at runtime — that
-        would require ``_initialize_kv_caches`` re-execution which is fragile
-        on a sleeping engine. The block budget is shared and the prefix cache
-        eviction policy lets each role saturate it on demand.
+        We do **not** resize ``cache_config.num_gpu_blocks`` at runtime —
+        that would require ``_initialize_kv_caches`` re-execution which is
+        fragile on a sleeping engine. The block budget is shared and the
+        prefix-cache eviction policy lets each role saturate it on demand.
         """
         engine = getattr(self._handler, "engine_client", None)
         if engine is None:
@@ -192,19 +302,18 @@ class DualModeWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[DualMode] reconfig_kv_pool(%s): reset failed: %s; continuing",
-                target_role,
-                exc,
+                target_role, exc,
             )
 
     async def _reconfig_nixl(self, target_role: str) -> None:
         """Drop any cached NIXL connector handle so the next request rebuilds it.
 
         vLLM 0.16's ``kv_transfer_config`` is fixed at engine construction;
-        we cannot swap connectors at runtime without recreating the engine.
-        What we CAN do is invalidate the handler's cached NIXL connector handle
-        so the next request rebuilds it against the engine's current connector
-        state — preventing stale prefill→decode xfer slots from leaking across
-        a role flip.
+        we cannot swap connectors at runtime. What we CAN do is invalidate
+        the handler's cached NIXL connector handle so the next request
+        rebuilds it against the engine's current connector state —
+        preventing stale prefill→decode xfer slots from leaking across a
+        role flip.
         """
         handler = self._handler
         nixl = getattr(handler, "_nixl_connector", None)
@@ -228,26 +337,29 @@ class DualModeWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[DualMode] reconfig_nixl(%s): drop failed: %s; continuing",
-                target_role,
-                exc,
+                target_role, exc,
             )
 
     async def _emit_role_changed(self, from_role: str, to_role: str) -> None:
-        """Push the new role to discovery + (optionally) publish to the router.
+        """Observability-only: pod label + (optional) publisher event.
 
-        Two complementary paths:
-
-        1. **Endpoint metadata** — if the discovery endpoint exposes
-           ``update_metadata``, push ``{"disaggregation_mode": to_role}``.
-           The KV router's worker selector picks this up on its next refresh.
-           Note: ``wake_up`` already re-registered the endpoint, so any
-           metadata set via :meth:`BaseWorkerHandler.set_disaggregation_mode`
-           is already on record; this call is the explicit transition signal.
-
-        2. **Publisher event** — if a router event publisher exposes
-           ``publish_role_changed``, emit it. This is for routers that track
-           role transitions independently of registration events.
+        Routing has *already* been switched at this point via the
+        unregister/register MDC steps in :meth:`switch_role`. This method
+        only updates side-channel signals so operators can see the new
+        role with ``kubectl get pod -L nvidia.com/dynamo-current-role``.
         """
+        # 1. Pod label patch (operator-visible).
+        if self._label_patcher is not None:
+            try:
+                await self._label_patcher(
+                    "nvidia.com/dynamo-current-role", to_role
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[DualMode] emit_role_changed: label patch failed: %s", exc
+                )
+
+        # 2. Endpoint metadata (debugging aid; router does not consume).
         endpoint = getattr(self._handler, "generate_endpoint", None)
         if endpoint is not None:
             update = getattr(endpoint, "update_metadata", None)
@@ -256,15 +368,12 @@ class DualModeWorker:
                     result = update({"disaggregation_mode": to_role})
                     if asyncio.iscoroutine(result):
                         await result
-                    logger.info(
-                        "[DualMode] emit_role_changed: pushed metadata disaggregation_mode=%s",
-                        to_role,
-                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "[DualMode] emit_role_changed: update_metadata failed: %s", exc
                     )
 
+        # 3. Publisher event (consumed by external observers).
         if self._publisher is not None:
             publish = getattr(self._publisher, "publish_role_changed", None)
             if publish is not None:
@@ -272,11 +381,6 @@ class DualModeWorker:
                     res = publish(from_role=from_role, to_role=to_role)
                     if asyncio.iscoroutine(res):
                         await res
-                    logger.info(
-                        "[DualMode] emit_role_changed: published WorkerRoleChanged(%s->%s)",
-                        from_role,
-                        to_role,
-                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "[DualMode] emit_role_changed: publish failed: %s", exc

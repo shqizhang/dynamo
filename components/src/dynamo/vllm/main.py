@@ -36,6 +36,7 @@ from dynamo.llm import (
     ModelType,
     fetch_model,
     register_model,
+    unregister_model,
 )
 
 # Optional imports for frontend decoding support
@@ -586,6 +587,81 @@ async def register_vllm_model(
     )
 
 
+class VllmReregistrar:
+    """Reregistrar implementation for the vLLM dual-mode worker (RL-Scaling).
+
+    Owns the per-role (endpoint, ModelType, ModelInput) tuples that
+    :func:`register_vllm_model` needs, and exposes the ``register`` /
+    ``unregister`` async methods consumed by
+    :class:`dynamo.vllm.dual_mode.DualModeWorker`.
+
+    The crucial behaviour: on a role flip the previous role's
+    ``ModelDeploymentCard`` is removed from etcd via ``unregister_model``
+    (which removes this worker from the router's WorkerSet for that role)
+    and a fresh MDC is published under the *target-role* endpoint URI via
+    ``register_vllm_model`` (which makes the router's PrefillRouter /
+    chat pool pick this worker up for the new role).
+
+    Endpoints map by role:
+        * ``decode``  -> ``<ns>.backend.<endpoint>``  ModelType=Chat|Completions
+        * ``prefill`` -> ``<ns>.prefill.<endpoint>``  ModelType=Prefill
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        engine_client: AsyncLLM,
+        vllm_config: VllmConfig,
+        endpoints_by_role: dict,  # role -> Endpoint
+        model_types_by_role: dict,  # role -> ModelType
+    ) -> None:
+        self._config = config
+        self._engine_client = engine_client
+        self._vllm_config = vllm_config
+        self._endpoints = endpoints_by_role
+        self._model_types = model_types_by_role
+        self._model_input = (
+            ModelInput.Text if config.use_vllm_tokenizer else ModelInput.Tokens
+        )
+
+    async def register(self, role: str) -> None:
+        ep = self._endpoints.get(role)
+        mt = self._model_types.get(role)
+        if ep is None or mt is None:
+            raise RuntimeError(
+                f"VllmReregistrar.register: no endpoint/model_type for role={role!r}; "
+                f"have roles={list(self._endpoints)}"
+            )
+        logger.info(
+            "[VllmReregistrar] register role=%s model_type=%s endpoint=%s",
+            role, mt, ep,
+        )
+        await register_vllm_model(
+            self._model_input,
+            mt,
+            ep,
+            self._config,
+            self._engine_client,
+            self._vllm_config,
+        )
+
+    async def unregister(self, role: str) -> None:
+        ep = self._endpoints.get(role)
+        if ep is None:
+            logger.warning(
+                "[VllmReregistrar] unregister: no endpoint for role=%s; skipping", role
+            )
+            return
+        try:
+            logger.info("[VllmReregistrar] unregister role=%s endpoint=%s", role, ep)
+            await unregister_model(ep)
+        except Exception as exc:  # noqa: BLE001
+            # Surface but don't crash: stale MDC will time out via etcd lease.
+            logger.warning(
+                "[VllmReregistrar] unregister(%s) failed (continuing): %s", role, exc
+            )
+
+
 async def init_prefill(
     runtime: DistributedRuntime,
     config: Config,
@@ -743,6 +819,35 @@ async def init(
         f"{config.namespace}.{config.component}.clear_kv_blocks"
     )
 
+    # ---- RL-Scaling: dual-mode partner endpoint (S2 true E2E switch) -------
+    # When DYNAMO_RL_DUAL_MODE=1, this decode worker also publishes a prefill
+    # endpoint URI so a /switch_role flip can re-register its MDC under the
+    # *prefill* endpoint and the frontend's PrefillRouter starts dispatching
+    # prefill traffic to it. Requires --kv-transfer-config to be present
+    # because NixlConnector cannot be added to a live engine.
+    _dual_mode_enabled = os.environ.get("DYNAMO_RL_DUAL_MODE") == "1"
+    _dual_partner_endpoint = None  # prefill-component endpoint when dual-mode
+    if _dual_mode_enabled:
+        _kv_cfg = getattr(config.engine_args, "kv_transfer_config", None)
+        if _kv_cfg is None:
+            raise RuntimeError(
+                "DYNAMO_RL_DUAL_MODE=1 requires --kv-transfer-config to be "
+                "set at engine startup (NixlConnector with kv_role=kv_both). "
+                "vLLM's KV transfer connector is fixed at engine construction; "
+                "without it a prefill role flip cannot push KV to the decode "
+                "side. Add to your DGD args: --kv-transfer-config "
+                "'{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}'"
+            )
+        _dual_partner_endpoint = runtime.endpoint(
+            f"{config.namespace}.prefill.{config.endpoint}"
+        )
+        logger.info(
+            "[RLScaling/DualMode] decode worker will also publish prefill "
+            "endpoint URI for hot role flips: %s.prefill.%s",
+            config.namespace, config.endpoint,
+        )
+    # ------------------------------------------------------------------------
+
     shutdown_endpoints[:] = [
         generate_endpoint,
         clear_endpoint,
@@ -842,7 +947,37 @@ async def init(
                 if config.disaggregation_mode == DisaggregationMode.PREFILL
                 else "decode"
             )
-            dual_mode = DualModeWorker(handler, initial_role=initial_role)
+
+            # Build the Reregistrar for true E2E role flips. When the
+            # partner endpoint is wired (DYNAMO_RL_DUAL_MODE=1), the
+            # DualModeWorker can publish a fresh MDC under the
+            # opposite-role endpoint URI on /switch_role, causing the
+            # frontend router to actually start dispatching new-role
+            # traffic to this worker. Without a partner endpoint the
+            # switch is in-process only (legacy behaviour).
+            _reregistrar = None
+            if _dual_partner_endpoint is not None:
+                _reregistrar = VllmReregistrar(
+                    config=config,
+                    engine_client=engine_client,
+                    vllm_config=vllm_config,
+                    endpoints_by_role={
+                        "decode": generate_endpoint,
+                        "prefill": _dual_partner_endpoint,
+                    },
+                    model_types_by_role={
+                        # Decode side keeps the chat/completions surface
+                        # the worker was originally registered with.
+                        "decode": parse_endpoint_types(config.endpoint_types),
+                        "prefill": ModelType.Prefill,
+                    },
+                )
+
+            dual_mode = DualModeWorker(
+                handler,
+                initial_role=initial_role,
+                reregistrar=_reregistrar,
+            )
 
             # Best-effort: KVBM cache manager exposed via engine internals.
             try:
@@ -968,6 +1103,45 @@ async def init(
                 metrics_labels=model_metrics_labels,
             ),
         ]
+
+        # ---- RL-Scaling: serve the prefill-component endpoint too ---------
+        # Both endpoints share the same engine. Initially only this worker's
+        # decode MDC is registered (so traffic only arrives on the decode
+        # URI). After /switch_role the VllmReregistrar publishes a fresh
+        # MDC under this prefill URI and the frontend's PrefillRouter
+        # starts dispatching prefill traffic here. PrefillWorkerHandler
+        # uses the token-in/token-out protocol with kv_transfer_params
+        # which the upstream prefill router already produces.
+        if _dual_partner_endpoint is not None:
+            partner_prefill_handler = PrefillWorkerHandler(
+                runtime,
+                engine_client,
+                default_sampling_params,
+                getattr(getattr(vllm_config, "model_config", None), "max_model_len", None),
+                enable_multimodal=config.enable_multimodal,
+                generate_endpoint=_dual_partner_endpoint,
+                config=config,
+                use_vllm_tokenizer=config.use_vllm_tokenizer,
+                shutdown_event=shutdown_event,
+                enable_frontend_decoding=config.frontend_decoding,
+            )
+            partner_prefill_health = VllmPrefillHealthCheckPayload(
+                engine_client, use_text_input=config.use_vllm_tokenizer
+            ).to_dict()
+            serve_tasks.append(
+                _dual_partner_endpoint.serve_endpoint(
+                    partner_prefill_handler.generate,
+                    graceful_shutdown=True,
+                    metrics_labels=model_metrics_labels,
+                    health_check_payload=partner_prefill_health,
+                )
+            )
+            shutdown_endpoints.append(_dual_partner_endpoint)
+            logger.info(
+                "[RLScaling/DualMode] partner prefill endpoint serving alongside "
+                "decode handler; awaiting /switch_role to publish prefill MDC"
+            )
+        # -------------------------------------------------------------------
 
         if lora_enabled:
             serve_tasks.extend(
