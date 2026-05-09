@@ -628,10 +628,14 @@ class VllmReregistrar:
         ep = self._endpoints.get(role)
         mt = self._model_types.get(role)
         if ep is None or mt is None:
-            raise RuntimeError(
-                f"VllmReregistrar.register: no endpoint/model_type for role={role!r}; "
-                f"have roles={list(self._endpoints)}"
+            # Role intentionally not served on this pod (e.g. partner-prefill
+            # disabled). Treated as a no-op so DualModeWorker.switch_role
+            # still works as a 'leave/rejoin own pool' elastic switch.
+            logger.info(
+                "[VllmReregistrar] register: role=%r not served on this pod; skipping",
+                role,
             )
+            return
         logger.info(
             "[VllmReregistrar] register role=%s model_type=%s endpoint=%s",
             role, mt, ep,
@@ -648,8 +652,9 @@ class VllmReregistrar:
     async def unregister(self, role: str) -> None:
         ep = self._endpoints.get(role)
         if ep is None:
-            logger.warning(
-                "[VllmReregistrar] unregister: no endpoint for role=%s; skipping", role
+            logger.info(
+                "[VllmReregistrar] unregister: role=%r not served on this pod; skipping",
+                role,
             )
             return
         try:
@@ -826,8 +831,19 @@ async def init(
     # prefill traffic to it. Requires --kv-transfer-config to be present
     # because NixlConnector cannot be added to a live engine.
     _dual_mode_enabled = os.environ.get("DYNAMO_RL_DUAL_MODE") == "1"
+    # Partner-prefill serving is OFF by default. Reason: vLLM 0.16's
+    # NixlConnector role (kv_role) is fixed at engine construction; even
+    # with kv_role=kv_both, an engine booted as a decode worker cannot
+    # synthesize prefill-side kv_transfer_params on the fly, so a
+    # partner-prefill endpoint would poison the prefill router pool with
+    # 50% HTTP 500s. With this OFF, /switch_role still performs a true
+    # E2E flip: target leaves the chat pool (decode MDC unregistered) on
+    # switch->prefill, and rejoins on switch->decode. Set
+    # DYNAMO_RL_DUAL_PARTNER_PREFILL=1 only after the live NixlConnector
+    # role-rebind work lands.
+    _dual_partner_serve = os.environ.get("DYNAMO_RL_DUAL_PARTNER_PREFILL") == "1"
     _dual_partner_endpoint = None  # prefill-component endpoint when dual-mode
-    if _dual_mode_enabled:
+    if _dual_mode_enabled and _dual_partner_serve:
         _kv_cfg = getattr(config.engine_args, "kv_transfer_config", None)
         if _kv_cfg is None:
             raise RuntimeError(
@@ -956,21 +972,18 @@ async def init(
             # traffic to this worker. Without a partner endpoint the
             # switch is in-process only (legacy behaviour).
             _reregistrar = None
-            if _dual_partner_endpoint is not None:
+            if _dual_mode_enabled:
+                _eps = {"decode": generate_endpoint}
+                _mts = {"decode": parse_endpoint_types(config.endpoint_types)}
+                if _dual_partner_endpoint is not None:
+                    _eps["prefill"] = _dual_partner_endpoint
+                    _mts["prefill"] = ModelType.Prefill
                 _reregistrar = VllmReregistrar(
                     config=config,
                     engine_client=engine_client,
                     vllm_config=vllm_config,
-                    endpoints_by_role={
-                        "decode": generate_endpoint,
-                        "prefill": _dual_partner_endpoint,
-                    },
-                    model_types_by_role={
-                        # Decode side keeps the chat/completions surface
-                        # the worker was originally registered with.
-                        "decode": parse_endpoint_types(config.endpoint_types),
-                        "prefill": ModelType.Prefill,
-                    },
+                    endpoints_by_role=_eps,
+                    model_types_by_role=_mts,
                 )
 
             dual_mode = DualModeWorker(
