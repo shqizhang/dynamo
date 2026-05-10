@@ -1179,7 +1179,17 @@ async def init(
                 """
                 merged_kv_params = None
                 last_chunk = None
+                chunk_count = 0
+                logger.info("[RLScaling/DualMode] _partner_prefill_generate ENTER")
                 async for chunk in partner_prefill_handler.generate(request, context):
+                    chunk_count += 1
+                    logger.info(
+                        "[RLScaling/DualMode] partner-prefill chunk #%d type=%s keys=%s dp=%s",
+                        chunk_count,
+                        type(chunk).__name__,
+                        list(chunk.keys()) if isinstance(chunk, dict) else None,
+                        chunk.get("disaggregated_params") if isinstance(chunk, dict) else None,
+                    )
                     if not isinstance(chunk, dict):
                         # Pass-through anything that isn't a token-mode dict
                         # response (errors, annotations, etc.) untouched.
@@ -1191,6 +1201,11 @@ async def init(
                         kv = dp.get("kv_transfer_params")
                         if kv:
                             merged_kv_params = kv
+                logger.info(
+                    "[RLScaling/DualMode] partner-prefill EXIT chunks=%d merged_kv=%s last_chunk=%s",
+                    chunk_count, bool(merged_kv_params),
+                    list(last_chunk.keys()) if isinstance(last_chunk, dict) else None,
+                )
                 if last_chunk is None:
                     return
                 if merged_kv_params is not None:
