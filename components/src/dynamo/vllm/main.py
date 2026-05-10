@@ -831,16 +831,31 @@ async def init(
     # prefill traffic to it. Requires --kv-transfer-config to be present
     # because NixlConnector cannot be added to a live engine.
     _dual_mode_enabled = os.environ.get("DYNAMO_RL_DUAL_MODE") == "1"
-    # Partner-prefill serving is OFF by default. Reason: vLLM 0.16's
-    # NixlConnector role (kv_role) is fixed at engine construction; even
-    # with kv_role=kv_both, an engine booted as a decode worker cannot
-    # synthesize prefill-side kv_transfer_params on the fly, so a
-    # partner-prefill endpoint would poison the prefill router pool with
-    # 50% HTTP 500s. With this OFF, /switch_role still performs a true
-    # E2E flip: target leaves the chat pool (decode MDC unregistered) on
-    # switch->prefill, and rejoins on switch->decode. Set
-    # DYNAMO_RL_DUAL_PARTNER_PREFILL=1 only after the live NixlConnector
-    # role-rebind work lands.
+    # Partner-prefill serving (turn this decode-booted engine into a real
+    # serving prefill worker on /switch_role) is gated behind
+    # DYNAMO_RL_DUAL_PARTNER_PREFILL=1.
+    #
+    # vLLM 0.16's NixlConnector with kv_role=kv_both *can* produce a
+    # disaggregated-prefill response from a decode-booted engine, but the
+    # connector populates `RequestOutput.kv_transfer_params` only on the
+    # FINAL streamed chunk (inside `request_finished`). The Rust
+    # PrefillRouter (lib/llm/src/kv_router/prefill_router.rs) reads
+    # `disaggregated_params` from the FIRST chunk of the prefill stream
+    # only — for a real prefill-mode pod the engine emits a single chunk
+    # so first==last and it just works, but for a dual-mode decode-booted
+    # engine the stream is multi-chunk and the router rejects the
+    # response with HTTP 500 ("No disaggregated params in prefill
+    # response"), poisoning the prefill pool with ~50% failures.
+    #
+    # The fix lives further down (`_partner_prefill_generate` wrapper):
+    # it buffers all chunks and emits ONE consolidated chunk with the
+    # merged `kv_transfer_params`, so the router's first-chunk read
+    # always sees a populated `disaggregated_params`. With this gate ON
+    # the partner endpoint serves real prefill traffic; with it OFF the
+    # /switch_role still does a true E2E "elastic decode pool" flip
+    # (target leaves the chat pool on switch->prefill via MDC
+    # unregister, rejoins on switch->decode via MDC register), but does
+    # not contribute prefill capacity.
     _dual_partner_serve = os.environ.get("DYNAMO_RL_DUAL_PARTNER_PREFILL") == "1"
     _dual_partner_endpoint = None  # prefill-component endpoint when dual-mode
     if _dual_mode_enabled and _dual_partner_serve:
@@ -1125,6 +1140,24 @@ async def init(
         # starts dispatching prefill traffic here. PrefillWorkerHandler
         # uses the token-in/token-out protocol with kv_transfer_params
         # which the upstream prefill router already produces.
+        #
+        # IMPORTANT (HTTP-500 fix for dual-mode partner prefill):
+        # The Rust PrefillRouter (lib/llm/src/kv_router/prefill_router.rs
+        # ::execute_prefill) extracts disaggregated_params from the FIRST
+        # streamed output chunk only. vLLM's NixlConnector (kv_role=kv_both)
+        # populates `RequestOutput.kv_transfer_params` only on the FINAL
+        # chunk of the prefill stream (set inside `request_finished`). For
+        # a real prefill-mode pod the engine usually emits exactly one
+        # chunk for a 1-token prefill request, so first==last and it just
+        # works. For a dual-mode pod whose engine was booted in DECODE
+        # mode but is now serving the prefill protocol via the partner
+        # endpoint, vLLM emits multiple chunks (the connector publishes
+        # kv_transfer_params only on the last one), and the router rejects
+        # the response with HTTP 500: "No disaggregated params in prefill
+        # response". The wrapper below buffers the chunks, merges the
+        # kv_transfer_params (last one wins), and yields a SINGLE
+        # consolidated chunk so the FIRST output the router sees always
+        # carries the disaggregated_params field.
         if _dual_partner_endpoint is not None:
             partner_prefill_handler = PrefillWorkerHandler(
                 runtime,
@@ -1138,12 +1171,54 @@ async def init(
                 shutdown_event=shutdown_event,
                 enable_frontend_decoding=config.frontend_decoding,
             )
+
+            async def _partner_prefill_generate(request, context):
+                """Buffer-and-merge wrapper around PrefillWorkerHandler.generate.
+
+                See block comment above for why this is necessary.
+                """
+                merged_kv_params = None
+                last_chunk = None
+                async for chunk in partner_prefill_handler.generate(request, context):
+                    if not isinstance(chunk, dict):
+                        # Pass-through anything that isn't a token-mode dict
+                        # response (errors, annotations, etc.) untouched.
+                        yield chunk
+                        continue
+                    last_chunk = chunk
+                    dp = chunk.get("disaggregated_params")
+                    if dp and isinstance(dp, dict):
+                        kv = dp.get("kv_transfer_params")
+                        if kv:
+                            merged_kv_params = kv
+                if last_chunk is None:
+                    return
+                if merged_kv_params is not None:
+                    last_chunk["disaggregated_params"] = {
+                        "kv_transfer_params": merged_kv_params
+                    }
+                else:
+                    # Engine produced no kv_transfer_params at all. Surface a
+                    # router-friendly None so the Rust side raises a clear
+                    # NoDisaggregatedParams instead of silently dropping the
+                    # field. The dual-mode flip is supposed to guarantee
+                    # connector availability; if this path is hit, switch_role
+                    # left the engine in an inconsistent state.
+                    last_chunk["disaggregated_params"] = None
+                    logger.warning(
+                        "[RLScaling/DualMode] partner prefill produced no "
+                        "kv_transfer_params for any chunk; downstream router "
+                        "will reject this response (request_id=%s)",
+                        getattr(context, "id", lambda: "?")(),
+                    )
+                yield last_chunk
+
             partner_prefill_health = VllmPrefillHealthCheckPayload(
                 engine_client, use_text_input=config.use_vllm_tokenizer
             ).to_dict()
             serve_tasks.append(
                 _dual_partner_endpoint.serve_endpoint(
-                    partner_prefill_handler.generate,
+                    _partner_prefill_generate,
                     graceful_shutdown=True,
                     metrics_labels=model_metrics_labels,
                     health_check_payload=partner_prefill_health,
@@ -1152,7 +1227,8 @@ async def init(
             shutdown_endpoints.append(_dual_partner_endpoint)
             logger.info(
                 "[RLScaling/DualMode] partner prefill endpoint serving alongside "
-                "decode handler; awaiting /switch_role to publish prefill MDC"
+                "decode handler (with chunk-buffering wrapper); awaiting /switch_role "
+                "to publish prefill MDC"
             )
         # -------------------------------------------------------------------
 
