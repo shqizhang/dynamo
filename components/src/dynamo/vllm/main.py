@@ -624,6 +624,10 @@ class VllmReregistrar:
             ModelInput.Text if config.use_vllm_tokenizer else ModelInput.Tokens
         )
 
+    def get_endpoint(self, role: str):
+        """Return the Endpoint object for the given role, or None."""
+        return self._endpoints.get(role)
+
     async def register(self, role: str) -> None:
         ep = self._endpoints.get(role)
         mt = self._model_types.get(role)

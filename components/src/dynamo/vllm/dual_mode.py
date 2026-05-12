@@ -74,6 +74,7 @@ class Reregistrar(Protocol):
 
     async def register(self, role: str) -> None: ...
     async def unregister(self, role: str) -> None: ...
+    def get_endpoint(self, role: str): ...  # returns Endpoint or None
 
 
 class DualModeWorker:
@@ -193,6 +194,26 @@ class DualModeWorker:
                         "timings_ms": timings,
                     }
 
+                # 1b. Also unregister the previous role's endpoint instance
+                #     if it differs from the handler's generate_endpoint.
+                #     (handler.sleep already unregisters generate_endpoint,
+                #      but we also need to remove the role-specific one.)
+                if self._reregistrar is not None:
+                    prev_ep = self._reregistrar.get_endpoint(previous_role)
+                    handler_ep = getattr(self._handler, "generate_endpoint", None)
+                    if prev_ep is not None and prev_ep is not handler_ep:
+                        try:
+                            await prev_ep.unregister_endpoint_instance()
+                            logger.info(
+                                "[DualMode] unregistered %s endpoint instance",
+                                previous_role,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "unregister %s endpoint instance failed (ok if first switch)",
+                                previous_role,
+                            )
+
                 # 2. Drop the previous-role MDC from discovery so the router
                 #    immediately stops considering this worker for old-role
                 #    traffic.  No-op when reregistrar is absent (unit tests).
@@ -222,6 +243,20 @@ class DualModeWorker:
                 t = mark("wake", t)
                 if wake_resp.get("status") not in {"ok", None}:
                     raise RuntimeError(f"wake_up failed: {wake_resp}")
+
+                # 7b. Register the target role's endpoint instance so the
+                #     PrefillRouter can discover this worker. The handler's
+                #     wake_up() only registers generate_endpoint (=backend),
+                #     but we also need the role-specific endpoint (=prefill).
+                if self._reregistrar is not None:
+                    target_ep = self._reregistrar.get_endpoint(target_role)
+                    handler_ep = getattr(self._handler, "generate_endpoint", None)
+                    if target_ep is not None and target_ep is not handler_ep:
+                        await target_ep.register_endpoint_instance()
+                        logger.info(
+                            "[DualMode] registered %s endpoint instance",
+                            target_role,
+                        )
 
                 # 8. Best-effort: pod label + router event for observability.
                 await self._emit_role_changed(previous_role, target_role)
