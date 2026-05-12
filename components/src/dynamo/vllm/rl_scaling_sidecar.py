@@ -14,6 +14,7 @@ Routes (default port 9090, override via ``DYNAMO_RL_SIDECAR_PORT``):
   - POST /switch_role          -> {"target_role":"decode"|"prefill"}  → DualModeWorker.switch_role
   - POST /migrate_out          -> {"request_id":"…"}                    → MigrationHandler.migrate_out
   - POST /migrate_in           -> {request_id, prompt_tokens, …}        → MigrationHandler.migrate_in
+  - POST /migration_complete   -> {"request_id":"…"}                    → MigrationHandler.migration_complete (Phase-2.B ack)
   - GET  /v1/active_requests   -> [...]   debugging aid
 
 The HTTP server runs as an asyncio task in the same event loop as the
@@ -321,12 +322,26 @@ def build_app(
             return web.json_response([])
         return web.json_response(registry.active_ids())
 
+    async def post_migration_complete(request):
+        if migration_handler is None:
+            return web.json_response(
+                {"status": "error", "message": "migration not enabled on this worker"},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        result = await migration_handler.migration_complete(body)
+        return web.json_response(result)
+
     app = web.Application()
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/v1/role", get_role)
     app.router.add_post("/switch_role", post_switch_role)
     app.router.add_post("/migrate_out", post_migrate_out)
     app.router.add_post("/migrate_in", post_migrate_in)
+    app.router.add_post("/migration_complete", post_migration_complete)
     app.router.add_get("/v1/active_requests", get_active)
     return app
 
@@ -357,6 +372,23 @@ async def start_sidecar(
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
+
+    # Phase-2.B: background task sweeps stale pending migrations.
+    if migration_handler is not None:
+        async def _sweeper():
+            while True:
+                await asyncio.sleep(2.0)
+                try:
+                    n = await migration_handler.sweep_stale_migrations()
+                    if n:
+                        logger.info(
+                            "[RLScalingSidecar] sweeper force-aborted %d stale migrations", n
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug("sweeper iteration failed", exc_info=True)
+
+        asyncio.get_event_loop().create_task(_sweeper())
+
     logger.info(
         "[RLScalingSidecar] listening on %s:%d (dual_mode=%s, migration=%s)",
         host,
