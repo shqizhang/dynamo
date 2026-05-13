@@ -11,10 +11,12 @@ This is the missing entrypoint that exposes ``DualModeWorker`` and
 Routes (default port 9090, override via ``DYNAMO_RL_SIDECAR_PORT``):
   - GET  /healthz              -> {"status":"ok"}
   - GET  /v1/role              -> {"current_role": "decode"|"prefill"}
-  - POST /switch_role          -> {"target_role":"decode"|"prefill"}  → DualModeWorker.switch_role
-  - POST /migrate_out          -> {"request_id":"…"}                    → MigrationHandler.migrate_out
-  - POST /migrate_in           -> {request_id, prompt_tokens, …}        → MigrationHandler.migrate_in
-  - POST /migration_complete   -> {"request_id":"…"}                    → MigrationHandler.migration_complete (Phase-2.B ack)
+  - POST /switch_role          -> DualModeWorker.switch_role
+  - POST /migrate_out          -> MigrationHandler.migrate_out (local)
+  - POST /migrate_in           -> MigrationHandler.migrate_in (local)
+  - POST /migration_complete   -> MigrationHandler.migration_complete (ack)
+  - POST /migration_rollback   -> MigrationHandler.migration_rollback (release hold)
+  - POST /migrate              -> coordinated: migrate_out + remote migrate_in + complete/rollback
   - GET  /v1/active_requests   -> [...]   debugging aid
 
 The HTTP server runs as an asyncio task in the same event loop as the
@@ -335,6 +337,97 @@ def build_app(
         result = await migration_handler.migration_complete(body)
         return web.json_response(result)
 
+    async def post_migration_rollback(request):
+        if migration_handler is None:
+            return web.json_response(
+                {"status": "error", "message": "migration not enabled on this worker"},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+        result = await migration_handler.migration_rollback(body)
+        return web.json_response(result)
+
+    async def post_migrate(request):
+        """Coordinated migration: migrate_out + remote migrate_in + complete/rollback.
+
+        Body: {"request_id": "*", "target_url": "http://<peer_pod_ip>:9091"}
+
+        Orchestrates the full migration in a single call:
+        1. Local migrate_out (holds request when connector_enabled)
+        2. Remote POST /migrate_in on target_url
+        3. On success: local migration_complete (abort + free)
+           On failure: local migration_rollback (release hold, request continues)
+        """
+        if migration_handler is None:
+            return web.json_response(
+                {"status": "error", "message": "migration not enabled on this worker"},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "invalid JSON"}, status=400)
+
+        target_url = body.get("target_url")
+        if not target_url or not isinstance(target_url, str):
+            return web.json_response(
+                {"status": "error", "message": "target_url is required"},
+                status=400,
+            )
+
+        # Step 1: local migrate_out (holds request if connector_enabled)
+        out_result = await migration_handler.migrate_out(body)
+        if out_result.get("status") != "ok":
+            return web.json_response(out_result)
+
+        real_rid = out_result["request_id"]
+
+        # Step 2: call target's /migrate_in
+        from aiohttp import ClientSession, ClientTimeout  # noqa: WPS433
+
+        try:
+            timeout = ClientTimeout(total=30)
+            async with ClientSession(timeout=timeout) as session:
+                target_migrate_in = f"{target_url.rstrip('/')}/migrate_in"
+                async with session.post(target_migrate_in, json=out_result) as resp:
+                    in_result = await resp.json()
+        except Exception as exc:
+            logger.warning(
+                "[Sidecar] coordinated migrate: target %s unreachable: %s",
+                target_url, exc,
+            )
+            rb = await migration_handler.migration_rollback({"request_id": real_rid})
+            return web.json_response({
+                "status": "error",
+                "request_id": real_rid,
+                "message": f"target unreachable: {exc}",
+                "rolled_back": rb.get("status") == "ok",
+            })
+
+        if in_result.get("status") == "ok":
+            # Step 3a: success -> complete (abort source, free blocks)
+            mc = await migration_handler.migration_complete({"request_id": real_rid})
+            return web.json_response({
+                "status": "ok",
+                "request_id": real_rid,
+                "migrate_out": out_result,
+                "migrate_in": in_result,
+                "migration_complete": mc,
+            })
+        else:
+            # Step 3b: declined/error -> rollback (keep source running)
+            rb = await migration_handler.migration_rollback({"request_id": real_rid})
+            return web.json_response({
+                "status": in_result.get("status", "error"),
+                "request_id": real_rid,
+                "migrate_out": out_result,
+                "migrate_in": in_result,
+                "rolled_back": rb.get("status") == "ok",
+            })
+
     app = web.Application()
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/v1/role", get_role)
@@ -342,6 +435,8 @@ def build_app(
     app.router.add_post("/migrate_out", post_migrate_out)
     app.router.add_post("/migrate_in", post_migrate_in)
     app.router.add_post("/migration_complete", post_migration_complete)
+    app.router.add_post("/migration_rollback", post_migration_rollback)
+    app.router.add_post("/migrate", post_migrate)
     app.router.add_get("/v1/active_requests", get_active)
     return app
 

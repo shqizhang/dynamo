@@ -2,70 +2,39 @@
 # SPDX-License-Identifier: Apache-2.0
 """S3 — Request consolidation HTTP handlers (RL-Scaling).
 
-Phase 2 (v3.5 · vLLM-native KV-D2D, two-tier delivery):
+Phase 2 (v4 · coordinated block-hold migration):
 
-* **Phase-2.A (已交付 · 零风险)** — smart recompute-prefill migration with
+* **Phase-2.A** — smart recompute-prefill migration with
   :class:`MigrationPolicy` cost-benefit gate + prefix-cache awareness.
-  ``migrate_out`` additionally exposes ``src_block_ids`` (looked up via
-  :class:`RequestBlockIndex`, which wraps the existing
-  ``KvbmCacheManager.get_block_ids`` PyO3-exposed API) so a Phase-2.B
-  invocation has everything it needs without changing the wire protocol.
 
-* **Phase-2.B (已交付主路径 · 需 GPU验证上线)** — real KV-D2D via vLLM's
-  built-in ``NixlConnector``. Architecture insight from fact-check (v3.5):
-  vLLM 0.16's ``NixlConnector`` already implements
-  ``kv_transfer_params``-driven NIXL READ pull (see vLLM 0.16
-  ``nixl_connector.py:177-220, 2063-2371`` and dynamo
-  ``handlers.py:1577-1589`` for the disagg-PD usage). When a worker is
-  deployed with that connector in its KV-transfer chain (``DynamoConnector``
-  + ``NixlConnector`` via ``MultiConnector``, the PD-disagg layout this
-  cluster already uses), migrate_in just needs to inject
-  ``sampling_params.extra_args["kv_transfer_params"]`` and vLLM does the
-  rest — no custom KVConnector subclass required.
+* **Phase-2.B (coordinated)** — when ``connector_enabled=True``
+  (env ``DYNAMO_RL_CONNECTOR_ENABLED=1``):
 
-  ``MigrationHandler`` is constructed with ``nixl_meta_provider`` (a
-  callable returning the *source* worker's NIXL coordinates, plumbed by
-  ``main.py`` from the engine's ``KvTransferConfig``); ``migrate_out``
-  packages those plus ``src_block_ids`` into the response’s
-  ``kv_transfer_params`` field. ``migrate_in`` forwards the dict verbatim
-  onto the resubmitted request. Any failure path falls back to Phase-2.A
-  recompute.
+  - ``migrate_out`` **always** defers abort (block-hold), regardless of
+    KVBM/NIXL availability.  Enables safe rollback if destination declines.
+  - KV transfer (NIXL pull) used only when both KVBM block IDs and NIXL
+    coordinates are available; otherwise falls back to recompute-prefill.
+  - ``migration_rollback`` releases hold without aborting — source
+    request continues as if nothing happened.
+  - ``/migrate`` coordinated sidecar endpoint orchestrates the full
+    migrate_out → remote migrate_in → complete/rollback flow.
 
-  **Known correctness gap (block-hold)**: Phase-2.B implements a 3-phase
-  block-hold protocol to avoid the abort/free race:
+  Block-hold protocol::
 
-  1. ``migrate_out`` does NOT abort the source request; instead it records
-     the request_id in ``_pending_migrations`` and returns
-     ``kv_transfer_params`` so the destination can do NIXL READ.
-  2. The orchestrator calls ``migrate_in`` on the destination.
-  3. The orchestrator calls ``/migration_complete`` on the source,
-     which aborts the request and frees the blocks.
+    1. migrate_out: hold request (defer abort, blocks pinned)
+    2. Orchestrator calls migrate_in on destination
+    3a. Success: migration_complete aborts source, frees blocks
+    3b. Failure: migration_rollback releases hold, source continues
 
-  A background sweeper force-aborts stale pending migrations after
-  ``DYNAMO_RL_MIGRATION_HOLD_TIMEOUT`` seconds (default 10).
-  Phase-2.B is gated behind ``connector_enabled``
-  (env ``DYNAMO_RL_CONNECTOR_ENABLED=1``, default off).
+  Sweeper force-aborts stale holds after DYNAMO_RL_MIGRATION_HOLD_TIMEOUT
+  seconds (default 10).
 
-Public surface (backward-compatible — existing Phase-1 callers unchanged):
+Public surface::
 
-    handler = MigrationHandler(
-        tracker,
-        policy=MigrationPolicy(),
-        engine=engine,
-        block_index=RequestBlockIndex(kvbm_cache_manager),     # 可选
-        nixl_meta_provider=lambda: {"engine_id": ...,           # 可选 (Phase-2.B)
-                                    "host": ..., "port": ...},
-        connector_enabled=False,                                # 安全默认
-    )
-    await handler.migrate_out({"request_id": rid})
-        -> {status, request_id, prompt_tokens, generated_tokens,
-            sampling_params, stop_conditions,
-            src_block_ids?,        # iff KVBM block_index available
-            kv_transfer_params?}   # iff connector_enabled and NIXL meta available
-    await handler.migrate_in({...})
-        -> {status: "ok"|"declined"|"error", path: "recompute"|"connector", ...}
-    await handler.migration_complete({"request_id": rid})      # Phase-2.B ack
-        -> {status: "ok"|"error"}
+    await handler.migrate_out(body)        -> {status, ..., kv_transfer_params?}
+    await handler.migrate_in(body)         -> {status, path, replay_tokens}
+    await handler.migration_complete(body) -> {status}
+    await handler.migration_rollback(body) -> {status}  # release hold, keep running
 """
 from __future__ import annotations
 
@@ -195,14 +164,11 @@ class MigrationHandler:
         self._engine = engine
         self._block_index = block_index or RequestBlockIndex(None)
         self._nixl_meta_provider = nixl_meta_provider
-        # Phase-2.B block-hold protocol: when connector_enabled=True,
-        # migrate_out does NOT abort the request immediately. Instead it
-        # records the request_id in _pending_migrations so the source engine
-        # keeps the KV blocks alive. The orchestrator (test script / RL
-        # controller) calls /migration_complete on the source AFTER the
-        # destination confirms it has pulled the KV via NIXL READ. Only
-        # then does the source abort and free blocks. A background sweeper
-        # force-aborts stale entries after _migration_hold_timeout_s.
+        # Phase-2.B block-hold: when connector_enabled=True, migrate_out
+        # ALWAYS defers abort (regardless of KVBM/NIXL availability).
+        # The orchestrator calls /migration_complete to abort+free, or
+        # /migration_rollback to release the hold and let the request
+        # continue.  Sweeper force-aborts stale entries.
         self._connector_enabled = connector_enabled
         self._pending_migrations: dict[str, float] = {}  # request_id -> monotonic ts
         self._migration_hold_timeout_s = float(
@@ -235,21 +201,21 @@ class MigrationHandler:
         src_block_ids = self._block_index.lookup(request_id)
         nixl_coords = self._read_nixl_meta()
 
-        # Phase-2.B block-hold: when connector is enabled AND we have NIXL
-        # coords, defer the abort so the dst can NIXL-READ the blocks.
-        # The request stays in-engine (generating tokens that we discard);
-        # blocks are freed only when /migration_complete is called or the
-        # hold timeout fires.
-        use_connector = (
+        # Phase-2.B block-hold: when connector_enabled=True, ALWAYS defer
+        # the abort so the orchestrator can rollback if dst declines.
+        # KV transfer path (NIXL) additionally requires KVBM + NIXL coords.
+        use_block_hold = self._connector_enabled
+        use_kv_transfer = (
             self._connector_enabled
             and src_block_ids is not None
             and nixl_coords is not None
         )
-        if use_connector:
+        if use_block_hold:
             self._pending_migrations[request_id] = time.monotonic()
             logger.info(
-                "[Migration] migrate_out: holding blocks for %s (connector path)",
-                request_id,
+                "[Migration] migrate_out: holding request %s "
+                "(block_hold=True, kv_transfer=%s)",
+                request_id, use_kv_transfer,
             )
         else:
             await self._tracker.abort_request(request_id)
@@ -264,7 +230,7 @@ class MigrationHandler:
         }
         if src_block_ids is not None:
             response["src_block_ids"] = src_block_ids
-        if use_connector:
+        if use_kv_transfer:
             # Build the same shape vLLM 0.16's NixlConnector expects on the
             # decode side (see handlers.py:1577 for the disagg-PD use of the
             # same dict). vLLM’s NixlConnectorScheduler at
@@ -419,6 +385,33 @@ class MigrationHandler:
             except Exception:  # noqa: BLE001
                 logger.debug("force-abort %s failed", rid, exc_info=True)
         return len(stale)
+
+    async def migration_rollback(self, body: dict) -> dict:
+        """Release a pending migration hold without aborting the request.
+
+        Called when the destination declines or the coordinated migration
+        fails.  The source request continues running as if ``migrate_out``
+        never happened.  Only meaningful when ``connector_enabled=True``
+        (block-hold mode); otherwise returns a harmless no-op.
+        """
+        request_id = self._validate_id(body)
+        if isinstance(request_id, dict):
+            return request_id  # error
+        ts = self._pending_migrations.pop(request_id, None)
+        if ts is None:
+            return {
+                "status": "ok",
+                "request_id": request_id,
+                "message": "not in pending (no-op)",
+            }
+        hold_ms = (time.monotonic() - ts) * 1000.0
+        logger.info(
+            "[Migration] migration_rollback: releasing hold on %s after "
+            "%.1fms (request continues on source)",
+            request_id,
+            hold_ms,
+        )
+        return {"status": "ok", "request_id": request_id, "hold_ms": hold_ms}
 
     # ------------------------------------------------------------------ utils
     def _read_nixl_meta(self) -> Optional[dict]:
