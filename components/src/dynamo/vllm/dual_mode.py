@@ -67,6 +67,37 @@ def _switch_drain_timeout() -> float:
     except (TypeError, ValueError):
         return 30.0
 
+
+def _flush_nixl_pending_sends(worker) -> dict:
+    """Runs INSIDE each engine worker (via AsyncLLM.collective_rpc).
+
+    While this worker served the prefill role it produced KV that the NIXL
+    connector holds in ``_reqs_to_send`` until a decode worker pulls it (up to
+    ``VLLM_NIXL_ABORT_REQUEST_TIMEOUT`` = 480s). Any un-pulled entry keeps its KV
+    blocks pinned (ref_cnt>0) so ``reset_prefix_cache`` cannot free them and the
+    role-switched decode engine runs with a shrunken/confused KV pool. Before a
+    role switch we force every pending send to expire NOW, so the next
+    ``get_finished`` reports it as finished-sending and the scheduler frees the
+    blocks. Best-effort and self-contained (cloudpickled to the worker process).
+    """
+    import time as _t
+    try:
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        conn = get_kv_transfer_group()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"no_kv_transfer_group: {exc}"}
+    cw = getattr(conn, "connector_worker", None) or conn
+    reqs = getattr(cw, "_reqs_to_send", None)
+    if not isinstance(reqs, dict):
+        return {"ok": False, "reason": "no__reqs_to_send"}
+    now = _t.perf_counter()
+    n = len(reqs)
+    for rid in list(reqs.keys()):
+        reqs[rid] = now  # already-elapsed -> expired on next get_finished()
+    return {"ok": True, "expired": n}
+
+
 _VALID_ROLES = ("prefill", "decode")
 
 
@@ -189,6 +220,15 @@ class DualModeWorker:
                 return now
 
             try:
+                # 0a. Expire the NIXL connector's pending KV sends left over from
+                #     the prefill role so their pinned blocks get freed by the
+                #     scheduler before we drain/sleep/reset below. Without this,
+                #     un-pulled sends keep ~thousands of blocks pinned and the
+                #     switched-back decode engine hangs long requests.
+                t = time.monotonic()
+                await self._flush_kv_connector()
+                t = mark("flush_kv_sends", t)
+
                 # 0. Drain in-flight requests BEFORE sleep so their KV blocks
                 #    are released. handler.sleep(level=2) pauses generation but
                 #    does not guarantee running requests finish, so their blocks
@@ -334,6 +374,22 @@ class DualModeWorker:
                 }
 
     # -------------------------------------------------------- real reconfig ops
+    async def _flush_kv_connector(self) -> None:
+        """Expire the NIXL connector's pending KV sends across all engine workers
+        so the scheduler frees the blocks they pin. Best-effort: any failure
+        (no connector, RPC unsupported) is logged and the switch continues."""
+        engine = getattr(self._handler, "engine_client", None)
+        rpc = getattr(engine, "collective_rpc", None) if engine is not None else None
+        if rpc is None:
+            return
+        try:
+            result = rpc(_flush_nixl_pending_sends)
+            if asyncio.iscoroutine(result):
+                result = await result
+            logger.info("[DualMode] flush_kv_connector: expired pending sends -> %s", result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DualMode] flush_kv_connector failed (%s); continuing", exc)
+
     async def _drain_inflight(self, timeout_s: float) -> None:
         """Release KV blocks held by in-flight work before a role switch.
 
