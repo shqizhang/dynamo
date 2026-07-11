@@ -63,9 +63,9 @@ logger = logging.getLogger(__name__)
 
 def _switch_drain_timeout() -> float:
     try:
-        return max(0.0, float(os.environ.get("DYNAMO_RL_SWITCH_DRAIN_TIMEOUT", "10.0")))
+        return max(0.0, float(os.environ.get("DYNAMO_RL_SWITCH_DRAIN_TIMEOUT", "30.0")))
     except (TypeError, ValueError):
-        return 10.0
+        return 30.0
 
 _VALID_ROLES = ("prefill", "decode")
 
@@ -335,45 +335,52 @@ class DualModeWorker:
 
     # -------------------------------------------------------- real reconfig ops
     async def _drain_inflight(self, timeout_s: float) -> None:
-        """Release KV blocks held by in-flight requests before a role switch.
+        """Release KV blocks held by in-flight work before a role switch.
 
-        Polls the worker's request registry for active ids and waits for them
-        to finish naturally (freeing their KV blocks); any straggler still
-        in-flight past ``timeout_s`` is aborted so ``reset_prefix_cache`` can
-        actually free every block. Best-effort — a missing registry/engine just
-        skips draining (unit-test handler stubs).
+        The registry only tracks requests that flow through the decode handler's
+        ``generate_tokens``. Partner-prefill requests (served via a separate
+        ``PrefillWorkerHandler`` that calls ``engine.generate`` directly) and
+        pending NIXL KV transfers keep blocks pinned (ref_cnt>0) WITHOUT
+        appearing in the registry, so a P->D switch-back then finds thousands of
+        blocks "not freed yet", shrinking the decode KV budget until long decode
+        requests hang. We therefore drain the *engine* itself to idle, then mop
+        up any registry straggler. Best-effort — missing engine/registry (unit
+        test stubs) just skips.
         """
-        registry = getattr(self._handler, "request_registry", None)
         engine = getattr(self._handler, "engine_client", None)
-        if registry is None:
-            return
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        while True:
+        # Primary: wait for the vLLM engine to become fully idle (covers
+        # partner-prefill requests + pending KV transfers the registry misses).
+        drain = getattr(engine, "wait_for_requests_to_drain", None) if engine is not None else None
+        if drain is not None:
+            try:
+                await drain(int(max(1.0, timeout_s)))
+                logger.info("[DualMode] drain: engine idle before switch")
+            except Exception as exc:  # noqa: BLE001 - includes TimeoutError
+                logger.warning(
+                    "[DualMode] drain: engine did not fully quiesce in %.0fs (%s); "
+                    "aborting stragglers", timeout_s, exc,
+                )
+        # Secondary: force-abort any registry-tracked straggler still present.
+        registry = getattr(self._handler, "request_registry", None)
+        if registry is not None:
             try:
                 active = list(registry.active_ids())
             except Exception:  # noqa: BLE001
-                return
-            if not active:
-                return
-            if time.monotonic() >= deadline:
-                for rid in active:
-                    try:
-                        if engine is not None:
-                            res = engine.abort(rid)
-                            if asyncio.iscoroutine(res):
-                                await res
-                    except Exception:  # noqa: BLE001
-                        logger.debug("[DualMode] drain abort(%s) failed", rid, exc_info=True)
-                    try:
-                        registry.deregister(rid)
-                    except Exception:  # noqa: BLE001
-                        pass
-                logger.info(
-                    "[DualMode] drain: force-aborted %d straggler(s) after %.1fs before switch",
-                    len(active), timeout_s,
-                )
-                return
-            await asyncio.sleep(0.2)
+                active = []
+            for rid in active:
+                try:
+                    if engine is not None:
+                        res = engine.abort(rid)
+                        if asyncio.iscoroutine(res):
+                            await res
+                except Exception:  # noqa: BLE001
+                    logger.debug("[DualMode] drain abort(%s) failed", rid, exc_info=True)
+                try:
+                    registry.deregister(rid)
+                except Exception:  # noqa: BLE001
+                    pass
+            if active:
+                logger.info("[DualMode] drain: aborted %d registry straggler(s)", len(active))
 
     async def _reconfig_kv_pool(self, target_role: str) -> None:
         """Reset the KV prefix cache so the new role starts with a clean pool.
