@@ -126,4 +126,20 @@ fi
 export MANIFEST_DIR="${TMP_MANIFESTS}"
 export RELEASE_VERSION
 echo "==> Invoking upstream deployer with MANIFEST_DIR=${MANIFEST_DIR} RELEASE_VERSION=${RELEASE_VERSION}"
-exec bash "${UPSTREAM_DEPLOYER}" "$@"
+bash "${UPSTREAM_DEPLOYER}" "$@"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RL-Scaling worker RBAC: the sidecar patches its own Pod's
+# nvidia.com/dynamo-current-role label after a role switch. The operator's
+# auto-provisioned discovery ServiceAccount does not include patch/get on
+# pods by default, so this must be applied on every (re)deploy — otherwise
+# the label patch 403s and role-change observability is lost.
+# See RL-Scaling/docs/S2-pd-role-switch-defect-analysis-zh.md §2.2.
+# ─────────────────────────────────────────────────────────────────────────────
+WORKER_RBAC_MANIFEST="${RL_SCALING_REPO}/deploy/manifests/04-worker-role-label-rbac.yaml"
+if [[ -f "${WORKER_RBAC_MANIFEST}" ]]; then
+  echo "==> Apply worker role-label RBAC (${WORKER_RBAC_MANIFEST})"
+  kubectl apply -f "${WORKER_RBAC_MANIFEST}"
+else
+  echo "WARN: worker RBAC manifest not found at ${WORKER_RBAC_MANIFEST}; pod label patch will 403"
+fi

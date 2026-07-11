@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.pyfix — thin overlay build for RL-Scaling worker fixes that do NOT
+# require recompiling the native toolchain (vLLM / NIXL / torch).
+#
+# The full dynamo-vllm-runtime image compiles those from source (~25GB, hours).
+# When a change touches only interpreted Python under
+# components/src/dynamo/vllm/ (and/or needs a pip-level remediation), we layer
+# the fix on top of an already-published runtime image instead of recompiling.
+# The result is a normal, immutable-tagged image (NOT a ConfigMap overlay) that
+# deploys through the exact same path as a full build.
+#
+# Two fixes are applied here:
+#   1. S2 role-ordering fix: components/src/dynamo/vllm/{dual_mode.py,main.py}
+#      (commit 51e64d5, on top of BASE_IMAGE's parent commit).
+#   2. NIXL ABI remediation: the BASE_IMAGE (rl-scaling-cccb9db) shipped THREE
+#      conflicting NIXL wheels — nixl 0.10.1, nixl-cu12 0.10.1, and a stray
+#      nixl-cu13 1.1.0. On the CUDA-12.9 runtime the cu13 (CUDA-13) build's
+#      libplugin_UCX.so is loaded but fails against the 0.10.1 libnixl_common
+#      with `undefined symbol: _Z18nixl_invalid_agent...`, so vLLM's
+#      NixlConnector cannot create the UCX backend and EngineCore never starts.
+#      Removing the wrong-CUDA cu13 wheel restores UCX. (cu12 matches the
+#      runtime and stays.)
+#
+# Build context must be the dynamo repo root:
+#   docker build -f deploy/RL-Scaling/Dockerfile.pyfix \
+#     --build-arg BASE_IMAGE=ghcr.io/shqizhang/dynamo-vllm-runtime:rl-scaling-<parent-sha> \
+#     -t ghcr.io/shqizhang/dynamo-vllm-runtime:rl-scaling-<fix-sha> .
+# ─────────────────────────────────────────────────────────────────────────────
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm
+
+# 1. S2 role-ordering fix (pure Python).
+COPY components/src/dynamo/vllm/dual_mode.py ${SITE_PACKAGES}/dual_mode.py
+COPY components/src/dynamo/vllm/main.py      ${SITE_PACKAGES}/main.py
+
+# 2. NIXL ABI remediation: drop the wrong-CUDA nixl-cu13 wheel so the UCX
+#    plugin resolves against the matching 0.10.1 libnixl_common.
+RUN /opt/dynamo/venv/bin/pip uninstall -y nixl-cu13 \
+    && /opt/dynamo/venv/bin/python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent('build-probe', nixl_agent_config(backends=['UCX'])); print('NIXL UCX backend OK')"
