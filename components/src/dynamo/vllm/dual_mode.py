@@ -54,10 +54,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+def _switch_drain_timeout() -> float:
+    try:
+        return max(0.0, float(os.environ.get("DYNAMO_RL_SWITCH_DRAIN_TIMEOUT", "10.0")))
+    except (TypeError, ValueError):
+        return 10.0
 
 _VALID_ROLES = ("prefill", "decode")
 
@@ -122,6 +130,7 @@ class DualModeWorker:
         self._label_patcher = label_patcher
         self._lock = asyncio.Lock()
         self._current_role = initial_role
+        self._drain_timeout_s = _switch_drain_timeout()
         try:
             handler.set_disaggregation_mode(initial_role)
         except Exception:  # noqa: BLE001 - tolerated for handler stubs in tests
@@ -180,9 +189,20 @@ class DualModeWorker:
                 return now
 
             try:
+                # 0. Drain in-flight requests BEFORE sleep so their KV blocks
+                #    are released. handler.sleep(level=2) pauses generation but
+                #    does not guarantee running requests finish, so their blocks
+                #    keep ref_cnt>0 and reset_prefix_cache below cannot free them
+                #    ("some blocks (N) are not freed yet"). Those leaked blocks
+                #    then shrink the new role's KV budget and make long decode
+                #    requests hang after a P->D switch-back. Wait for natural
+                #    completion, then force-abort any straggler past the timeout.
+                t = time.monotonic()
+                await self._drain_inflight(self._drain_timeout_s)
+                t = mark("drain", t)
+
                 # 1. Drain & sleep so the GPU is quiesced and the current
                 #    endpoint instance is unregistered from discovery.
-                t = time.monotonic()
                 sleep_resp = await self._handler.sleep({"level": 2})
                 t = mark("sleep", t)
                 if sleep_resp.get("status") not in {"ok", None}:
@@ -314,6 +334,47 @@ class DualModeWorker:
                 }
 
     # -------------------------------------------------------- real reconfig ops
+    async def _drain_inflight(self, timeout_s: float) -> None:
+        """Release KV blocks held by in-flight requests before a role switch.
+
+        Polls the worker's request registry for active ids and waits for them
+        to finish naturally (freeing their KV blocks); any straggler still
+        in-flight past ``timeout_s`` is aborted so ``reset_prefix_cache`` can
+        actually free every block. Best-effort — a missing registry/engine just
+        skips draining (unit-test handler stubs).
+        """
+        registry = getattr(self._handler, "request_registry", None)
+        engine = getattr(self._handler, "engine_client", None)
+        if registry is None:
+            return
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                active = list(registry.active_ids())
+            except Exception:  # noqa: BLE001
+                return
+            if not active:
+                return
+            if time.monotonic() >= deadline:
+                for rid in active:
+                    try:
+                        if engine is not None:
+                            res = engine.abort(rid)
+                            if asyncio.iscoroutine(res):
+                                await res
+                    except Exception:  # noqa: BLE001
+                        logger.debug("[DualMode] drain abort(%s) failed", rid, exc_info=True)
+                    try:
+                        registry.deregister(rid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                logger.info(
+                    "[DualMode] drain: force-aborted %d straggler(s) after %.1fs before switch",
+                    len(active), timeout_s,
+                )
+                return
+            await asyncio.sleep(0.2)
+
     async def _reconfig_kv_pool(self, target_role: str) -> None:
         """Reset the KV prefix cache so the new role starts with a clean pool.
 
@@ -345,9 +406,22 @@ class DualModeWorker:
         try:
             result = reset()
             if asyncio.iscoroutine(result):
-                await result
+                result = await result
+            # vLLM returns False (and logs "some blocks (N) are not freed yet")
+            # when a running request still pins blocks. If drain missed one,
+            # abort remaining and retry once so the new role gets a clean pool.
+            if result is False:
+                logger.warning(
+                    "[DualMode] reconfig_kv_pool(%s): reset_prefix_cache reported "
+                    "blocks still pinned; draining and retrying", target_role,
+                )
+                await self._drain_inflight(2.0)
+                result = reset()
+                if asyncio.iscoroutine(result):
+                    result = await result
             logger.info(
-                "[DualMode] reconfig_kv_pool(%s): reset_prefix_cache OK", target_role
+                "[DualMode] reconfig_kv_pool(%s): reset_prefix_cache result=%s",
+                target_role, result,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

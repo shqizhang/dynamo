@@ -168,6 +168,34 @@ class InProcessRequestRegistry:
     def active_ids(self) -> list[str]:
         return list(self._snapshots.keys())
 
+    def active_progress(self) -> list[dict]:
+        """Per-request token progress for S3 consolidation targeting.
+
+        ``max_tokens`` comes from the request's sampling params;
+        ``remaining_tokens`` is ``max_tokens - generated_tokens`` (>=0) and is
+        the quantity the decision engine / test trigger use to pick a straggler
+        that is old enough to migrate yet has enough runtime left to be worth it.
+        """
+        out: list[dict] = []
+        for rid, snap in self._snapshots.items():
+            generated = len(snap.generated_tokens)
+            max_tokens = snap.sampling_params_dict.get("max_tokens")
+            try:
+                max_tokens = int(max_tokens) if max_tokens is not None else None
+            except (TypeError, ValueError):
+                max_tokens = None
+            remaining = max(0, max_tokens - generated) if max_tokens is not None else None
+            out.append(
+                {
+                    "request_id": rid,
+                    "prompt_tokens": len(snap.prompt_tokens),
+                    "generated_tokens": generated,
+                    "max_tokens": max_tokens,
+                    "remaining_tokens": remaining,
+                }
+            )
+        return out
+
 
 # --------------------------------------------------------------------- tracker
 class EngineRequestTracker:
@@ -322,7 +350,10 @@ def build_app(
     async def get_active(_request):
         if registry is None:
             return web.json_response([])
-        return web.json_response(registry.active_ids())
+        # Enriched list of {request_id, prompt/generated/max/remaining_tokens}.
+        # len() of this list still equals the active count (backward compatible
+        # with callers that only counted ids).
+        return web.json_response(registry.active_progress())
 
     async def post_migration_complete(request):
         if migration_handler is None:
