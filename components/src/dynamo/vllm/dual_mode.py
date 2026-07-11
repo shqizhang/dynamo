@@ -227,8 +227,12 @@ class DualModeWorker:
                 await self._reconfig_kv_pool(target_role)
                 t = mark("reset_prefix_cache", t)
 
-                # 5. Persist the new role on the handler (read by handler.generate).
+                # 5. Persist the new role on the handler and dispatcher before
+                # publishing the target MDC. The registered generate endpoint
+                # is role-aware and reads DualModeWorker.current_role, so it
+                # must not briefly serve target-role traffic as the old role.
                 self._handler.set_disaggregation_mode(target_role)
+                self._current_role = target_role
 
                 # 6. Publish a fresh MDC under the target-role endpoint URI.
                 #    The frontend's ModelWatcher will rebuild WorkerSets and
@@ -237,8 +241,12 @@ class DualModeWorker:
                     await self._reregistrar.register(target_role)
                     t = mark("register_mdc", t)
 
-                # 7. Wake the engine and re-register the current handler's
-                #    endpoint instance back to discovery.
+                # 7. Wake the engine. BaseWorkerHandler.wake_up() always
+                #    re-registers handler.generate_endpoint. For a decode
+                #    component this is the backend endpoint, which is correct
+                #    for target_role=decode but wrong for target_role=prefill.
+                #    Clean it up immediately below before publishing the
+                #    target endpoint instance.
                 wake_resp = await self._handler.wake_up({})
                 t = mark("wake", t)
                 if wake_resp.get("status") not in {"ok", None}:
@@ -252,6 +260,13 @@ class DualModeWorker:
                     target_ep = self._reregistrar.get_endpoint(target_role)
                     handler_ep = getattr(self._handler, "generate_endpoint", None)
                     if target_ep is not None and target_ep is not handler_ep:
+                        if handler_ep is not None:
+                            await handler_ep.unregister_endpoint_instance()
+                            logger.info(
+                                "[DualMode] unregistered handler endpoint instance "
+                                "after wake for target_role=%s",
+                                target_role,
+                            )
                         await target_ep.register_endpoint_instance()
                         logger.info(
                             "[DualMode] registered %s endpoint instance",
@@ -261,7 +276,6 @@ class DualModeWorker:
                 # 8. Best-effort: pod label + router event for observability.
                 await self._emit_role_changed(previous_role, target_role)
 
-                self._current_role = target_role
                 total_ms = (time.monotonic() - t0) * 1000.0
                 logger.info(
                     "[DualMode] switch_role %s->%s OK total=%.2fms timings=%s",
@@ -288,6 +302,7 @@ class DualModeWorker:
                             logger.exception("recovery re-register failed")
                     await self._handler.wake_up({})
                     self._handler.set_disaggregation_mode(previous_role)
+                    self._current_role = previous_role
                 except Exception:  # noqa: BLE001
                     logger.exception("recovery wake_up also failed")
                 return {

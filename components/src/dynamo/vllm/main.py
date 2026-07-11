@@ -721,6 +721,34 @@ async def init_prefill(
     )
     handler.add_temp_dir(prometheus_temp_dir)
 
+    # RL-Scaling: expose the same sidecar observability surface on native
+    # prefill workers. Native prefill is not wired for true P->D role switch,
+    # so /switch_role intentionally remains unavailable while /v1/role and
+    # /v1/active_requests are usable by controller/test gates.
+    sidecar_runner = None
+    if os.environ.get("DYNAMO_RL_SIDECAR_DISABLED") != "1":
+        try:
+            from dynamo.vllm.rl_scaling_sidecar import (
+                InProcessRequestRegistry,
+                start_sidecar,
+            )
+
+            registry = InProcessRequestRegistry()
+            handler.request_registry = registry
+            sidecar_runner, _site = await start_sidecar(
+                dual_mode_worker=None,
+                migration_handler=None,
+                initial_role="prefill",
+                registry=registry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RLScalingSidecar] failed to start on prefill worker (%s); "
+                "continuing without it",
+                exc,
+            )
+            sidecar_runner = None
+
     # Check if kv event consolidator is enabled (port was allocated in setup_vllm_engine)
     consolidator_enabled = False
     consolidator_port = None
@@ -806,6 +834,11 @@ async def init_prefill(
         raise
     finally:
         logger.debug("Cleaning up prefill worker")
+        if sidecar_runner is not None:
+            try:
+                await sidecar_runner.cleanup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[RLScalingSidecar] cleanup raised: %s", exc)
         handler.cleanup()
 
 
