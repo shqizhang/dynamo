@@ -162,6 +162,9 @@ class DualModeWorker:
         self._lock = asyncio.Lock()
         self._current_role = initial_role
         self._drain_timeout_s = _switch_drain_timeout()
+        # True once cordon() has withdrawn this worker's ModelCard (S3
+        # scale-down). switch_role() re-publishes a card, so it clears this.
+        self._cordoned = False
         try:
             handler.set_disaggregation_mode(initial_role)
         except Exception:  # noqa: BLE001 - tolerated for handler stubs in tests
@@ -174,6 +177,59 @@ class DualModeWorker:
         return self._current_role
 
     # ------------------------------------------------------------------ public
+    async def cordon(self) -> dict:
+        """Withdraw this worker's current-role ModelCard WITHOUT touching the engine.
+
+        S3 scale-down previously went ``drain -> scale replicas`` and relied on
+        the trigger (batch_completion >= 0.92) to mean "no new work is arriving".
+        That is not a guarantee: between the drain check and the pod actually
+        terminating, the pod is still in the frontend's WorkerSet, so KvRouter
+        can route a NEW request onto a decoder that is about to be deleted —
+        which then dies with EngineShutdown.
+
+        Cordoning removes the worker from the router's candidate set first
+        (cordon -> drain -> delete, the standard Kubernetes pattern that
+        ``switch_role`` already follows), while leaving the engine running so
+        any already-accepted request can still finish. Idempotent.
+        """
+        if self._reregistrar is None:
+            return {"status": "error", "message": "no reregistrar; cannot cordon"}
+        if self._cordoned:
+            return {"status": "ok", "message": "already cordoned", "role": self._current_role}
+        t0 = time.monotonic()
+        try:
+            await self._reregistrar.unregister(self._current_role)
+            self._cordoned = True
+            logger.info("[DualMode] cordon: withdrew %s ModelCard", self._current_role)
+            return {
+                "status": "ok",
+                "role": self._current_role,
+                "cordon_time_ms": (time.monotonic() - t0) * 1000.0,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cordon failed")
+            return {"status": "error", "message": str(exc)}
+
+    async def uncordon(self) -> dict:
+        """Re-publish the current-role ModelCard (undo :meth:`cordon`).
+
+        Used when a planned scale-down is abandoned after the pod was already
+        cordoned, so the worker rejoins the router's candidate set instead of
+        idling invisibly. Idempotent.
+        """
+        if self._reregistrar is None:
+            return {"status": "error", "message": "no reregistrar; cannot uncordon"}
+        if not self._cordoned:
+            return {"status": "ok", "message": "not cordoned", "role": self._current_role}
+        try:
+            await self._reregistrar.register(self._current_role)
+            self._cordoned = False
+            logger.info("[DualMode] uncordon: republished %s ModelCard", self._current_role)
+            return {"status": "ok", "role": self._current_role}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("uncordon failed")
+            return {"status": "error", "message": str(exc)}
+
     async def switch_role(self, target_role: str) -> dict:
         """Flip the worker's role. Returns an HTTP-friendly response dict.
 
@@ -299,6 +355,9 @@ class DualModeWorker:
                 #    start sending new-role traffic to this worker.
                 if self._reregistrar is not None:
                     await self._reregistrar.register(target_role)
+                    # A switch publishes a fresh card, so any prior cordon
+                    # (S3 scale-down that was abandoned) no longer applies.
+                    self._cordoned = False
                     t = mark("register_mdc", t)
 
                 # 7. Wake the engine. BaseWorkerHandler.wake_up() always

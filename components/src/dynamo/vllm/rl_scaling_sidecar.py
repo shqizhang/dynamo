@@ -460,9 +460,38 @@ def build_app(
             })
 
     app = web.Application()
+    async def post_cordon(_request):
+        """S3: withdraw this worker's ModelCard so the router stops selecting it.
+
+        Called before a consolidation scale-down (cordon -> drain -> delete) so
+        no new request is routed onto a decoder that is about to be removed.
+        The engine keeps running; already-accepted requests still finish.
+        """
+        if dual_mode_worker is None:
+            return web.json_response(
+                {"status": "error", "message": "dual_mode not enabled on this worker"},
+                status=503,
+            )
+        result = await dual_mode_worker.cordon()
+        status = 200 if result.get("status") == "ok" else 500
+        return web.json_response(result, status=status)
+
+    async def post_uncordon(_request):
+        """S3: republish the ModelCard (undo /cordon) if a scale-down is abandoned."""
+        if dual_mode_worker is None:
+            return web.json_response(
+                {"status": "error", "message": "dual_mode not enabled on this worker"},
+                status=503,
+            )
+        result = await dual_mode_worker.uncordon()
+        status = 200 if result.get("status") == "ok" else 500
+        return web.json_response(result, status=status)
+
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/v1/role", get_role)
     app.router.add_post("/switch_role", post_switch_role)
+    app.router.add_post("/cordon", post_cordon)
+    app.router.add_post("/uncordon", post_uncordon)
     app.router.add_post("/migrate_out", post_migrate_out)
     app.router.add_post("/migrate_in", post_migrate_in)
     app.router.add_post("/migration_complete", post_migration_complete)

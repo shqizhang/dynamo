@@ -33,11 +33,18 @@ FROM ${BASE_IMAGE}
 ARG SITE_PACKAGES=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm
 
 # 1. RL-Scaling worker-side fixes (pure Python): S2 role ordering + switch-back
-#    drain (dual_mode), native-prefill sidecar (main), and token-progress
-#    /v1/active_requests for S3 (rl_scaling_sidecar).
+#    drain + cordon/uncordon (dual_mode), native-prefill sidecar and /cordon
+#    routes (main, rl_scaling_sidecar), token-progress /v1/active_requests and
+#    migration-fidelity fixes for S3 (handlers, migration).
+#
+#    NOTE: every RL-Scaling Python file the worker needs MUST be listed here.
+#    handlers.py and migration.py were previously omitted, so fixes to them
+#    would silently never reach the image while the build still "succeeded".
 COPY components/src/dynamo/vllm/dual_mode.py          ${SITE_PACKAGES}/dual_mode.py
 COPY components/src/dynamo/vllm/main.py               ${SITE_PACKAGES}/main.py
 COPY components/src/dynamo/vllm/rl_scaling_sidecar.py ${SITE_PACKAGES}/rl_scaling_sidecar.py
+COPY components/src/dynamo/vllm/handlers.py           ${SITE_PACKAGES}/handlers.py
+COPY components/src/dynamo/vllm/migration.py          ${SITE_PACKAGES}/migration.py
 
 # 2. NIXL ABI remediation: drop the wrong-CUDA nixl-cu13 wheel so the UCX
 #    plugin resolves against the matching 0.10.1 libnixl_common.

@@ -4,13 +4,16 @@
 import asyncio
 import base64
 import binascii
+import dataclasses
 import io
+import json
 import logging
 import os
 import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, Final
@@ -49,6 +52,89 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# RL-Scaling S3: request-registry extraction helpers.
+#
+# These feed the InProcessRequestRegistry, whose snapshot is what
+# /migrate_out ships to a peer decoder. Anything dropped here is silently
+# lost across a migration, so both helpers are deliberately generic.
+# --------------------------------------------------------------------------
+
+# Not migration state; never copy into a replayed request.
+_SP_EXCLUDED = {"extra_args", "logits_processors", "guided_decoding", "allowed_token_ids"}
+
+# Last-resort field list if the SamplingParams type exposes no introspection.
+_SP_FALLBACK_FIELDS = (
+    "temperature", "top_p", "top_k", "min_p", "max_tokens", "min_tokens",
+    "presence_penalty", "frequency_penalty", "repetition_penalty",
+    "stop", "stop_token_ids", "seed", "n", "ignore_eos", "logprobs",
+    "prompt_logprobs", "skip_special_tokens", "include_stop_str_in_output",
+    "spaces_between_special_tokens", "detokenize", "bad_words",
+)
+
+
+def _extract_prompt_token_ids(prompt) -> list:
+    """Return the prompt's token ids, for either a dict or an object prompt.
+
+    vLLM's ``TokensPrompt`` is a **TypedDict**, so ``prompt`` is a plain dict
+    and ``getattr(prompt, "prompt_token_ids", [])`` silently yields ``[]``.
+    That made every registry snapshot prompt-less, so a migrated request was
+    replayed as ``[] + generated_tokens`` — i.e. it lost the user's prompt.
+    Handle the mapping case first, then fall back to attribute access.
+    """
+    if prompt is None:
+        return []
+    if isinstance(prompt, Mapping):
+        return list(prompt.get("prompt_token_ids") or [])
+    return list(getattr(prompt, "prompt_token_ids", None) or [])
+
+
+def _sampling_params_to_dict(sampling_params) -> dict:
+    """JSON-safe snapshot of *all* sampling params, not a hand-picked subset.
+
+    The previous implementation copied a closed list of 12 names, which
+    silently dropped ``ignore_eos`` (and anything else) — a migrated request
+    then stopped at natural EOS instead of honouring its original stopping
+    policy. Enumerate the real fields so migration is faithful by default.
+    """
+    if sampling_params is None:
+        return {}
+    fields = None
+    # msgspec.Struct (vLLM v1) exposes __struct_fields__
+    fields = getattr(sampling_params, "__struct_fields__", None)
+    if not fields:
+        try:
+            if dataclasses.is_dataclass(sampling_params):
+                fields = [f.name for f in dataclasses.fields(sampling_params)]
+        except Exception:  # noqa: BLE001
+            fields = None
+    if not fields:
+        d = getattr(sampling_params, "__dict__", None)
+        fields = list(d.keys()) if d else None
+    if not fields:
+        fields = _SP_FALLBACK_FIELDS
+
+    out: dict = {}
+    for k in fields:
+        if not isinstance(k, str) or k.startswith("_") or k in _SP_EXCLUDED:
+            continue
+        v = getattr(sampling_params, k, None)
+        if v is None:
+            continue
+        if isinstance(v, tuple):
+            v = list(v)
+        # Keep the snapshot JSON-serialisable: the sidecar ships it over HTTP.
+        if isinstance(v, (bool, int, float, str)) or (
+            isinstance(v, (list, dict))
+        ):
+            try:
+                json.dumps(v)
+            except (TypeError, ValueError):
+                continue
+            out[k] = v
+    return out
 
 
 @dataclass(frozen=True)
@@ -1244,14 +1330,8 @@ class BaseWorkerHandler(ABC):
         registry = getattr(self, "request_registry", None)
         if registry is not None:
             try:
-                prompt_tokens_for_reg = list(getattr(prompt, "prompt_token_ids", []) or [])
-                sp_dict = {}
-                for k in ("temperature", "top_p", "top_k", "max_tokens", "min_tokens",
-                          "presence_penalty", "frequency_penalty", "repetition_penalty",
-                          "stop", "stop_token_ids", "seed", "n"):
-                    v = getattr(sampling_params, k, None)
-                    if v is not None:
-                        sp_dict[k] = v
+                prompt_tokens_for_reg = _extract_prompt_token_ids(prompt)
+                sp_dict = _sampling_params_to_dict(sampling_params)
                 registry.register(
                     request_id,
                     prompt_tokens_for_reg,
