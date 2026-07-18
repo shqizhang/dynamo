@@ -68,6 +68,17 @@ def _switch_drain_timeout() -> float:
         return 30.0
 
 
+def _cordon_settle_seconds() -> float:
+    """How long switch_role waits after withdrawing its ModelCard before it
+    quiesces the engine, so the frontend's ModelWatcher observes the
+    withdrawal and stops routing new traffic here first. Bounds the
+    switch-instant request-loss race (see switch_role step 0-pre)."""
+    try:
+        return max(0.0, float(os.environ.get("DYNAMO_RL_CORDON_SETTLE", "0.5")))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 def _flush_nixl_pending_sends(worker) -> dict:
     """Runs INSIDE each engine worker (via AsyncLLM.collective_rpc).
 
@@ -162,8 +173,10 @@ class DualModeWorker:
         self._lock = asyncio.Lock()
         self._current_role = initial_role
         self._drain_timeout_s = _switch_drain_timeout()
+        self._cordon_settle_s = _cordon_settle_seconds()
         # True once cordon() has withdrawn this worker's ModelCard (S3
-        # scale-down). switch_role() re-publishes a card, so it clears this.
+        # scale-down, and now the cordon-first step of switch_role).
+        # switch_role() re-publishes a card at the end, so it clears this.
         self._cordoned = False
         try:
             handler.set_disaggregation_mode(initial_role)
@@ -276,6 +289,29 @@ class DualModeWorker:
                 return now
 
             try:
+                # 0-pre. CORDON FIRST — fixes the S2 switch-instant request
+                #   loss. The steps below drain and then sleep(level=2) the
+                #   engine, but the previous ordering did not withdraw this
+                #   worker's ModelCard until step 2 (after drain+sleep). So
+                #   throughout drain+sleep the card was still published and the
+                #   router could route a NEW request onto this worker; sleep
+                #   then 500'd it (observed: 1/105 requests, HTTP 500, 0 tokens,
+                #   during the D->P switch in prefill_burst — 2 of 6 S2 runs).
+                #   Withdraw the current-role card up front and give the
+                #   frontend's ModelWatcher a bounded settle window to observe
+                #   the withdrawal BEFORE we quiesce the engine, so drain sees a
+                #   closed intake and sleep has nothing live to kill. This is the
+                #   cordon->drain->delete order the rest of this method already
+                #   documents; cordon() uses the same unregister.
+                t = time.monotonic()
+                if self._reregistrar is not None and not self._cordoned:
+                    await self._reregistrar.unregister(previous_role)
+                    self._cordoned = True
+                    t = mark("cordon", t)
+                    if self._cordon_settle_s > 0:
+                        await asyncio.sleep(self._cordon_settle_s)
+                        t = mark("cordon_settle", t)
+
                 # 0a. Expire the NIXL connector's pending KV sends left over from
                 #     the prefill role so their pinned blocks get freed by the
                 #     scheduler before we drain/sleep/reset below. Without this,
@@ -332,8 +368,9 @@ class DualModeWorker:
 
                 # 2. Drop the previous-role MDC from discovery so the router
                 #    immediately stops considering this worker for old-role
-                #    traffic.  No-op when reregistrar is absent (unit tests).
-                if self._reregistrar is not None:
+                #    traffic.  No-op when reregistrar is absent (unit tests) or
+                #    when step 0-pre already cordoned (the normal path now).
+                if self._reregistrar is not None and not self._cordoned:
                     await self._reregistrar.unregister(previous_role)
                     t = mark("unregister_mdc", t)
 
@@ -417,6 +454,9 @@ class DualModeWorker:
                     if self._reregistrar is not None:
                         try:
                             await self._reregistrar.register(previous_role)
+                            # Re-published the previous-role card, so the
+                            # cordon-first withdrawal no longer applies.
+                            self._cordoned = False
                         except Exception:  # noqa: BLE001
                             logger.exception("recovery re-register failed")
                     await self._handler.wake_up({})
