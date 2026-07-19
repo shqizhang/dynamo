@@ -87,6 +87,49 @@ class TestSetDisaggregationMode:
             h.set_disaggregation_mode("garbage")
 
 
+class _StubRegistry:
+    """active_ids() returns non-empty for the first `busy_calls` calls, then []."""
+    def __init__(self, busy_calls=0):
+        self._busy = busy_calls
+    def active_ids(self):
+        if self._busy > 0:
+            self._busy -= 1
+            return ["r1"]
+        return []
+    def deregister(self, rid):
+        pass
+
+
+class TestQuiesce:
+    @pytest.mark.asyncio
+    async def test_quiesce_returns_when_idle(self):
+        h = _make_handler()
+        h.request_registry = _StubRegistry(busy_calls=0)
+        w = DualModeWorker(h, initial_role="decode")
+        res = await w._drain_and_quiesce(stable_s=0.05, timeout_s=5)
+        assert res["quiesced"] is True
+        assert res["arrivals_after_cordon"] == 0
+
+    @pytest.mark.asyncio
+    async def test_quiesce_detects_late_arrival_then_settles(self):
+        h = _make_handler()
+        # active_ids reports a late arrival on an early stable-window poll, then
+        # goes idle -> the loop re-drains and eventually quiesces.
+        h.request_registry = _StubRegistry(busy_calls=2)
+        w = DualModeWorker(h, initial_role="decode")
+        res = await w._drain_and_quiesce(stable_s=0.05, timeout_s=5)
+        assert res["quiesced"] is True
+        assert res["arrivals_after_cordon"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_quiesce_stable_zero_single_drain(self):
+        h = _make_handler()
+        h.request_registry = _StubRegistry(busy_calls=0)
+        w = DualModeWorker(h, initial_role="decode")
+        res = await w._drain_and_quiesce(stable_s=0.0, timeout_s=5)
+        assert res["quiesced"] is True
+
+
 # ------------------------------------------------------------ DualModeWorker
 class TestDualModeWorker:
     def test_rejects_invalid_initial_role(self):

@@ -69,14 +69,16 @@ def _switch_drain_timeout() -> float:
 
 
 def _cordon_settle_seconds() -> float:
-    """How long switch_role waits after withdrawing its ModelCard before it
-    quiesces the engine, so the frontend's ModelWatcher observes the
-    withdrawal and stops routing new traffic here first. Bounds the
-    switch-instant request-loss race (see switch_role step 0-pre)."""
+    """The QUIESCE stable-idle window: after withdrawing its ModelCard and
+    draining to idle, switch_role requires the engine to stay idle (no new
+    arrivals) for this long continuously before sleeping, confirming the
+    frontend has stopped routing here. Bounds the switch-instant request-loss
+    race under high concurrency. A fixed 0.5s was too short; 1.5s covers the
+    ModelCard-withdrawal propagation to the router."""
     try:
-        return max(0.0, float(os.environ.get("DYNAMO_RL_CORDON_SETTLE", "0.5")))
+        return max(0.0, float(os.environ.get("DYNAMO_RL_CORDON_SETTLE", "1.5")))
     except (TypeError, ValueError):
-        return 0.5
+        return 1.5
 
 
 def _flush_nixl_pending_sends(worker) -> dict:
@@ -308,9 +310,6 @@ class DualModeWorker:
                     await self._reregistrar.unregister(previous_role)
                     self._cordoned = True
                     t = mark("cordon", t)
-                    if self._cordon_settle_s > 0:
-                        await asyncio.sleep(self._cordon_settle_s)
-                        t = mark("cordon_settle", t)
 
                 # 0a. Expire the NIXL connector's pending KV sends left over from
                 #     the prefill role so their pinned blocks get freed by the
@@ -329,8 +328,17 @@ class DualModeWorker:
                 #    then shrink the new role's KV budget and make long decode
                 #    requests hang after a P->D switch-back. Wait for natural
                 #    completion, then force-abort any straggler past the timeout.
+                #    QUIESCE HANDSHAKE (fixes the residual switch-instant 500s
+                #    under high concurrency): a fixed post-cordon settle is not
+                #    enough — the frontend's routing pipeline keeps dispatching to
+                #    this worker until it observes the ModelCard withdrawal, so a
+                #    request can slip in AFTER drain returns idle and get 500'd by
+                #    sleep. Instead, drain to idle then CONFIRM the engine stays
+                #    idle for a stable window (no new arrivals => the router has
+                #    stopped routing here); any arrival re-drains and re-confirms.
                 t = time.monotonic()
-                await self._drain_inflight(self._drain_timeout_s)
+                quiesce = await self._drain_and_quiesce(self._cordon_settle_s, self._drain_timeout_s)
+                timings["quiesce_arrivals_after_cordon"] = quiesce.get("arrivals_after_cordon", 0)
                 t = mark("drain", t)
 
                 # 1. Drain & sleep so the GPU is quiesced and the current
@@ -536,6 +544,48 @@ class DualModeWorker:
                     pass
             if active:
                 logger.info("[DualMode] drain: aborted %d registry straggler(s)", len(active))
+
+    def _inflight_count(self) -> int:
+        """Best-effort count of decode requests currently accepted by this
+        worker (registry-tracked). Used by the quiesce handshake to detect NEW
+        arrivals after cordon. 0 when no registry (unit-test stubs)."""
+        reg = getattr(self._handler, "request_registry", None)
+        if reg is None:
+            return 0
+        try:
+            return len(reg.active_ids())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    async def _drain_and_quiesce(self, stable_s: float, timeout_s: float) -> dict:
+        """Drain to idle, then CONFIRM the engine stays idle for ``stable_s``
+        continuously before returning — i.e. no new request has arrived, so the
+        frontend has drained its routing pipeline to this (cordoned) worker. Any
+        arrival during the stable window re-drains and re-confirms. Bounded by
+        ``timeout_s``. This is the handshake that closes the residual
+        switch-instant 500 race a fixed settle delay left open under high
+        concurrency. ``stable_s`` == 0 falls back to a single drain."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        arrivals_after_cordon = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            await self._drain_inflight(max(1.0, min(self._drain_timeout_s, remaining)) if remaining > 0 else 1.0)
+            if stable_s <= 0:
+                return {"quiesced": True, "arrivals_after_cordon": arrivals_after_cordon}
+            # Confirm the engine STAYS idle for stable_s (no new arrivals).
+            stable_deadline = time.monotonic() + stable_s
+            interrupted = False
+            while time.monotonic() < stable_deadline:
+                if self._inflight_count() > 0:
+                    arrivals_after_cordon += 1
+                    interrupted = True
+                    break
+                await asyncio.sleep(0.1)
+            if not interrupted:
+                return {"quiesced": True, "arrivals_after_cordon": arrivals_after_cordon}
+            if time.monotonic() >= deadline:
+                logger.warning("[DualMode] quiesce timed out with late arrivals=%d; proceeding", arrivals_after_cordon)
+                return {"quiesced": False, "arrivals_after_cordon": arrivals_after_cordon}
 
     async def _reconfig_kv_pool(self, target_role: str) -> None:
         """Reset the KV prefix cache so the new role starts with a clean pool.
