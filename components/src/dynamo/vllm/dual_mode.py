@@ -111,6 +111,27 @@ def _flush_nixl_pending_sends(worker) -> dict:
     return {"ok": True, "expired": n}
 
 
+def _count_nixl_pending_sends(worker) -> dict:
+    """Runs INSIDE each engine worker (via AsyncLLM.collective_rpc).
+
+    Read-only companion to :func:`_flush_nixl_pending_sends`: report how many
+    produced-but-not-yet-pulled KV sends the connector still tracks, so the
+    switch can WAIT for peers to finish pulling instead of destroying their
+    in-flight reads (see ``_wait_outbound_kv_drained``).
+    """
+    try:
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        conn = get_kv_transfer_group()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"no_kv_transfer_group: {exc}", "pending": 0}
+    cw = getattr(conn, "connector_worker", None) or conn
+    reqs = getattr(cw, "_reqs_to_send", None)
+    if not isinstance(reqs, dict):
+        return {"ok": False, "reason": "no__reqs_to_send", "pending": 0}
+    return {"ok": True, "pending": len(reqs)}
+
+
 _VALID_ROLES = ("prefill", "decode")
 
 
@@ -349,15 +370,6 @@ class DualModeWorker:
                     self._cordoned = True
                     t = mark("cordon", t)
 
-                # 0a. Expire the NIXL connector's pending KV sends left over from
-                #     the prefill role so their pinned blocks get freed by the
-                #     scheduler before we drain/sleep/reset below. Without this,
-                #     un-pulled sends keep ~thousands of blocks pinned and the
-                #     switched-back decode engine hangs long requests.
-                t = time.monotonic()
-                await self._flush_kv_connector()
-                t = mark("flush_kv_sends", t)
-
                 # 0. Drain in-flight requests BEFORE sleep so their KV blocks
                 #    are released. handler.sleep(level=2) pauses generation but
                 #    does not guarantee running requests finish, so their blocks
@@ -378,6 +390,21 @@ class DualModeWorker:
                 quiesce = await self._drain_and_quiesce(self._cordon_settle_s, self._drain_timeout_s)
                 timings["quiesce_arrivals_after_cordon"] = quiesce.get("arrivals_after_cordon", 0)
                 t = mark("drain", t)
+
+                # 0a. Wait for OUTBOUND KV to drain before sleep frees VRAM.
+                #     While this worker held the prefill role it produced KV
+                #     that peer decoders pull via NIXL READ; interrupting an
+                #     in-flight pull (or force-expiring a send about to be
+                #     pulled) hangs the peer's request. Bounded wait first;
+                #     only true orphans are force-expired on timeout. At a
+                #     phase boundary with no handoff in flight this passes on
+                #     the first poll (~0 cost); under load it is the honest
+                #     zero-loss fabric-drain cost.
+                t = time.monotonic()
+                outbound = await self._wait_outbound_kv_drained(timeout_s=8.0)
+                timings["kv_outbound_drain_waited_ms"] = round(
+                    float(outbound.get("waited_s", 0.0)) * 1000.0, 3)
+                t = mark("kv_outbound_drain", t)
 
                 # 1. Drain & sleep so the GPU is quiesced and the current
                 #    endpoint instance is unregistered from discovery.
@@ -538,6 +565,70 @@ class DualModeWorker:
                 self._switch_complete.set()
 
     # -------------------------------------------------------- real reconfig ops
+    async def _wait_outbound_kv_drained(self, timeout_s: float = 8.0) -> dict:
+        """Wait for peers to finish pulling KV this worker produced as prefill.
+
+        ``sleep(level=2)`` frees GPU memory, so switching while a peer decode
+        worker's NIXL READ against this worker's KV is still in flight breaks
+        that transfer and hangs the peer's request until its client timeout
+        (observed 2026-07-23: P->D at early-B left 646 blocks pinned and hung
+        32 peer decodes to their 600s timeout). Force-expiring the pending
+        sends (the old flush-first order) is just as destructive for pulls
+        that are about to start. So: WAIT, bounded, for (a) the connector's
+        pending-send registry to empty and (b) the block pool to report no
+        pinned blocks (``reset_prefix_cache`` returns True only then; calling
+        it on the cordoned+drained engine is safe and it is reset again after
+        sleep). Only what survives the wait is a true orphan (nobody pulled it
+        for ``timeout_s``) and gets force-expired by the flush fallback.
+
+        Cost model: this is load-dependent zero-loss drain (phase-boundary
+        switches with no outbound KV pass on the first poll at ~0 cost; a
+        switch under active prefill handoff pays the fabric-drain time).
+        """
+        t0 = time.monotonic()
+        engine = getattr(self._handler, "engine_client", None)
+        rpc = getattr(engine, "collective_rpc", None) if engine is not None else None
+        reset = getattr(engine, "reset_prefix_cache", None) if engine is not None else None
+        polls = 0
+        pending = -1
+        pinned_clear = None
+        while time.monotonic() - t0 < timeout_s:
+            polls += 1
+            pending = 0
+            if rpc is not None:
+                try:
+                    result = rpc(_count_nixl_pending_sends)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    for entry in result if isinstance(result, list) else [result]:
+                        pending += int((entry or {}).get("pending", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    pending = 0  # introspection unavailable -> rely on reset probe
+            pinned_clear = None
+            if reset is not None:
+                try:
+                    pinned_clear = reset()
+                    if asyncio.iscoroutine(pinned_clear):
+                        pinned_clear = await pinned_clear
+                except Exception:  # noqa: BLE001
+                    pinned_clear = None
+            if pending == 0 and pinned_clear is not False:
+                waited = time.monotonic() - t0
+                logger.info(
+                    "[DualMode] outbound KV drained (polls=%d, waited=%.3fs)",
+                    polls, waited,
+                )
+                return {"drained": True, "waited_s": waited, "polls": polls}
+            await asyncio.sleep(0.25)
+        waited = time.monotonic() - t0
+        logger.warning(
+            "[DualMode] outbound KV drain timed out after %.1fs "
+            "(pending_sends=%s, pinned_clear=%s); force-expiring leftovers",
+            waited, pending, pinned_clear,
+        )
+        await self._flush_kv_connector()
+        return {"drained": False, "waited_s": waited, "polls": polls}
+
     async def _flush_kv_connector(self) -> None:
         """Expire the NIXL connector's pending KV sends across all engine workers
         so the scheduler frees the blocks they pin. Best-effort: any failure

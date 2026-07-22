@@ -249,7 +249,9 @@ class TestDualModeWorker:
         h = _make_handler()
         w = DualModeWorker(h, initial_role="decode")
         await w.switch_role("prefill")
-        h.engine_client.reset_prefix_cache.assert_awaited_once()
+        # Awaited at least twice: once as the outbound-KV-drain pinned-block
+        # probe (pre-sleep) and once by reconfig_kv_pool (post-sleep).
+        assert h.engine_client.reset_prefix_cache.await_count >= 2
 
     @pytest.mark.asyncio
     async def test_reconfig_kv_pool_tolerates_missing_api(self):
