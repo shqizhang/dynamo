@@ -1246,14 +1246,51 @@ async def init(
                 )
             yield last_chunk
 
+        def _has_decode_kv_params(request) -> bool:
+            """True when the request carries kv_transfer_params produced by a
+            prior prefill step — an unambiguous decode-intent marker."""
+            try:
+                dp = request.get("disaggregated_params")
+                return bool(isinstance(dp, dict) and dp.get("kv_transfer_params"))
+            except Exception:  # noqa: BLE001
+                return False
+
         async def _generate_dispatch(request, context):
-            """Polymorphic generate: pick handler based on current dual-mode role."""
+            """Polymorphic generate: pick handler based on dual-mode role.
+
+            Zero-loss switch window (RL-Scaling): between cordon (old
+            ModelCard withdrawn) and register (new card published) the
+            router can only be acting on the OLD card, so any arrival in
+            that window is old-role traffic *by construction*. Instead of
+            letting sleep() reject it (the switch-instant 500), HOLD it
+            until the switch completes, then serve it under the pre-switch
+            role. This is what makes a short cordon-settle safe.
+            """
             dm = getattr(handler, "_rl_dual_mode", None)
-            if (
-                partner_prefill_handler is not None
-                and dm is not None
-                and getattr(dm, "current_role", "decode") == "prefill"
-            ):
+            role = getattr(dm, "current_role", "decode") if dm is not None else "decode"
+
+            if dm is not None and getattr(dm, "switch_in_progress", False):
+                intent = getattr(dm, "switch_previous_role", role)
+                ok = await dm.wait_switch_complete(timeout_s=20.0)
+                logger.info(
+                    "[RLScaling/DualMode] held request through switch window "
+                    "(intent=%s, completed=%s, request_id=%s)",
+                    intent, ok, getattr(context, "id", lambda: "?")(),
+                )
+                role = intent  # serve under the role the router dispatched for
+
+            # Permanent stale guard: a request carrying prefill-produced
+            # kv_transfer_params is decode-intent regardless of our current
+            # role (e.g. routed just before a D->P withdrawal converged).
+            if role == "prefill" and _has_decode_kv_params(request):
+                logger.info(
+                    "[RLScaling/DualMode] stale decode-intent request served "
+                    "on prefill-role worker (request_id=%s)",
+                    getattr(context, "id", lambda: "?")(),
+                )
+                role = "decode"
+
+            if partner_prefill_handler is not None and role == "prefill":
                 async for chunk in _partner_prefill_generate(request, context):
                     yield chunk
                 return

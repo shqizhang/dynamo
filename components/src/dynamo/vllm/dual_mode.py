@@ -176,6 +176,17 @@ class DualModeWorker:
         self._current_role = initial_role
         self._drain_timeout_s = _switch_drain_timeout()
         self._cordon_settle_s = _cordon_settle_seconds()
+        # --- switch-window hold support (zero-loss fast switch) ---------
+        # Between cordon (old ModelCard withdrawn) and register (new card
+        # published) the router can only be acting on the OLD card, so any
+        # request arriving in that window is old-role traffic by
+        # construction. The dispatcher in main.py uses these to HOLD such
+        # arrivals until the switch completes and then serve them under the
+        # pre-switch role instead of letting sleep() 500 them. This is what
+        # makes a short cordon-settle safe.
+        self._switch_complete = asyncio.Event()
+        self._switch_complete.set()  # no switch in progress at boot
+        self._switch_previous_role: str = initial_role
         # True once cordon() has withdrawn this worker's ModelCard (S3
         # scale-down, and now the cordon-first step of switch_role).
         # switch_role() re-publishes a card at the end, so it clears this.
@@ -190,6 +201,27 @@ class DualModeWorker:
     @property
     def current_role(self) -> str:
         return self._current_role
+
+    @property
+    def switch_in_progress(self) -> bool:
+        """True while switch_role is between cordon and register+wake."""
+        return not self._switch_complete.is_set()
+
+    @property
+    def switch_previous_role(self) -> str:
+        """The role this worker had when the in-progress switch began.
+        Arrivals during the switch window are, by construction, traffic
+        for this role (the new card is not published yet)."""
+        return self._switch_previous_role
+
+    async def wait_switch_complete(self, timeout_s: float = 20.0) -> bool:
+        """Block until the in-progress switch finishes (True) or the
+        timeout elapses (False). Returns immediately when idle."""
+        try:
+            await asyncio.wait_for(self._switch_complete.wait(), timeout=timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ------------------------------------------------------------------ public
     async def cordon(self) -> dict:
@@ -284,6 +316,12 @@ class DualModeWorker:
             t0 = time.monotonic()
             previous_role = self._current_role
             timings: dict[str, float] = {}
+
+            # Open the switch window: the dispatcher holds new arrivals
+            # (which can only be previous-role traffic until register)
+            # instead of letting sleep() reject them.
+            self._switch_previous_role = previous_role
+            self._switch_complete.clear()
 
             def mark(label: str, since: float) -> float:
                 now = time.monotonic()
@@ -450,6 +488,21 @@ class DualModeWorker:
                     "new_role": target_role,
                     "switch_time_ms": total_ms,
                     "timings_ms": timings,
+                    # Routing-convergence acknowledgements. The old-role ack is
+                    # observational (cordon applied + a stable arrival-silence
+                    # window with any switch-window arrivals HELD and served
+                    # under the old role — zero loss either way). A
+                    # deterministic Rust router-epoch ACK remains future work.
+                    "frontend_ack": {
+                        "acknowledged": bool(quiesce.get("quiesced", False)),
+                        "method": "cordon+arrival_silence+hold",
+                        "arrivals_after_cordon": quiesce.get("arrivals_after_cordon", 0),
+                        "settle_window_s": self._cordon_settle_s,
+                    },
+                    "frontend_target_ready": {
+                        "acknowledged": True,
+                        "method": "target_mdc_registered+engine_awake",
+                    },
                 }
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -479,6 +532,10 @@ class DualModeWorker:
                     "switch_time_ms": (time.monotonic() - t0) * 1000.0,
                     "timings_ms": timings,
                 }
+            finally:
+                # Close the switch window: release any held dispatcher
+                # arrivals (they are served under switch_previous_role).
+                self._switch_complete.set()
 
     # -------------------------------------------------------- real reconfig ops
     async def _flush_kv_connector(self) -> None:
