@@ -600,20 +600,55 @@ def make_submit_request_callback(engine_client: Any) -> Callable[[str, dict], Aw
     from vllm.inputs import TokensPrompt
     from vllm.sampling_params import SamplingParams
 
+    # Migration state that must never be replayed verbatim: `extra_args` is
+    # rebuilt below from this migration's own kv_transfer_params, and the
+    # rest are engine-internal objects that do not survive a JSON round-trip.
+    _SP_NEVER_REPLAY = {"extra_args", "logits_processors", "guided_decoding",
+                        "allowed_token_ids", "output_kind", "_all_stop_token_ids",
+                        "_bad_words_token_ids"}
+    # Last-resort subset if the constructor refuses a replayed field.
+    _SP_MINIMAL_REPLAY = {"temperature", "top_p", "top_k", "max_tokens",
+                          "min_tokens", "stop", "stop_token_ids", "seed", "n",
+                          "ignore_eos"}
+
     async def _submit(request_id: str, payload: dict) -> None:
         prompt_tokens = list(payload.get("prompt_tokens") or [])
         if not prompt_tokens:
             raise ValueError(f"submit_request[{request_id}]: empty prompt_tokens")
         sp_dict = payload.get("sampling_params") or {}
-        # Build SamplingParams without exploding on unknown fields. We only
-        # forward the well-defined subset; anything unrecognised is ignored.
+        # Replay EVERY sampling field the source snapshotted, not a hand-picked
+        # subset. The previous closed list of 12 names omitted `ignore_eos`, so
+        # a migrated request silently swapped its stopping policy: the source
+        # snapshot carried ignore_eos=True faithfully (handlers.py enumerates
+        # all fields) and this rebuild dropped it, letting the replayed request
+        # stop at the first natural EOS. Measured on suite
+        # phased-v2-20260723-084824: all 4 runs that performed a real migration
+        # ended their migrated `ignore_eos, max_tokens=5000` straggler at
+        # finish_reason=stop after 1557-4578 tokens, while all 11 runs without a
+        # migration ran every straggler to length@5000 -- a 4/4 vs 0/11 split.
+        # Symmetry with the source snapshot is the invariant: accept whatever
+        # SamplingParams actually defines, drop only what must not be replayed.
         sp_kwargs = {}
-        for key in ("temperature", "top_p", "top_k", "max_tokens", "min_tokens",
-                    "presence_penalty", "frequency_penalty", "repetition_penalty",
-                    "stop", "stop_token_ids", "seed", "n"):
-            if key in sp_dict:
-                sp_kwargs[key] = sp_dict[key]
-        sampling_params = SamplingParams(**sp_kwargs)
+        try:
+            allowed = set(getattr(SamplingParams, "__struct_fields__", ()) or ())
+        except Exception:  # noqa: BLE001
+            allowed = set()
+        for key, value in sp_dict.items():
+            if key in _SP_NEVER_REPLAY:
+                continue
+            if allowed and key not in allowed:
+                continue
+            sp_kwargs[key] = value
+        try:
+            sampling_params = SamplingParams(**sp_kwargs)
+        except TypeError as exc:  # a field the constructor refuses
+            logger.warning(
+                "[Sidecar] submit_request[%s]: SamplingParams rejected a "
+                "replayed field (%s); retrying without it", request_id, exc,
+            )
+            sp_kwargs = {k: v for k, v in sp_kwargs.items()
+                         if k in _SP_MINIMAL_REPLAY}
+            sampling_params = SamplingParams(**sp_kwargs)
         kv_params = payload.get("kv_transfer_params")
         if kv_params:
             if sampling_params.extra_args is None:
